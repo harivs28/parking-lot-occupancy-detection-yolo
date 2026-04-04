@@ -138,13 +138,3 @@ You can also click any **sample image** from the gallery to quickly test the sys
 - **Dataset**: CNRPark (CNR, Pisa)
 
 <br>
-
-## Credits
-
-- Original C++ implementation by Daniele Ninni
-- Based on the CNRPark dataset
-- Computer Vision Project — University of Padua, A.Y. 2021/22
-
-<p align="center">
-  <img src="https://user-images.githubusercontent.com/62724611/166108149-7629a341-bbca-4a3e-8195-67f469a0cc08.png" alt="" height="70"/>
-</p>
