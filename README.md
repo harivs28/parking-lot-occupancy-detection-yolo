@@ -131,6 +131,7 @@ The current slot overlays are still based on the 9 CNRPark camera layouts, so be
 - **Dataset**: CNRPark (CNR, Pisa)
 
 <br>
+<<<<<<< HEAD
 
 ## Credits
 
@@ -141,3 +142,5 @@ The current slot overlays are still based on the 9 CNRPark camera layouts, so be
 <p align="center">
   <img src="https://user-images.githubusercontent.com/62724611/166108149-7629a341-bbca-4a3e-8195-67f469a0cc08.png" alt="" height="70"/>
 </p>
+=======
+>>>>>>> 4e358cf17af6b20ffa6face763393ab69b451f07

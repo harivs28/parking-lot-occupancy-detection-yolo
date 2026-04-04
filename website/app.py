@@ -65,9 +65,9 @@ DEFAULT_NMS_IOU_THRESHOLD = 0.45
 DEFAULT_SLOT_OVERLAP_THRESHOLD = 0.50
 DEFAULT_DETECTION_AREA_THRESHOLD = 5
 DETECTION_MAX_SIDE = 1920
-TILE_SIZE = 960
+TILE_SIZE = 768
 TILE_OVERLAP_RATIO = 0.35
-TILE_TRIGGER_DETECTION_COUNT = 8
+TILE_TRIGGER_DETECTION_COUNT = 12
 TILE_CONFIDENCE_THRESHOLD = 0.12
 LAYOUT_MIN_FEATURE_SCORE = 120.0
 LAYOUT_MIN_FEATURE_RATIO = 3.0
@@ -522,9 +522,18 @@ def run_vehicle_detection(
     iou_threshold: float = DEFAULT_NMS_IOU_THRESHOLD,
 ) -> list[dict]:
     """Run YOLOv5 inference and return deduplicated vehicle detections."""
-    all_detections = run_yolo_on_region(image, confidence_threshold)
+    global_detections = run_yolo_on_region(image, confidence_threshold)
+    deduplicated_global_detections = apply_non_max_suppression(
+        global_detections,
+        confidence_threshold,
+        iou_threshold,
+    )
 
-    if max(image.shape[:2]) >= TILE_SIZE and len(all_detections) < TILE_TRIGGER_DETECTION_COUNT:
+    all_detections = list(global_detections)
+    if (
+        max(image.shape[:2]) >= TILE_SIZE
+        and len(deduplicated_global_detections) < TILE_TRIGGER_DETECTION_COUNT
+    ):
         for tile_image, offset_x, offset_y in generate_detection_tiles(image):
             tile_detections = run_yolo_on_region(
                 tile_image,
