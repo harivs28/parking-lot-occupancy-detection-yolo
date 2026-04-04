@@ -2,3 +2,5 @@ flask==3.1.0
 opencv-python-headless==4.11.0.86
 onnxruntime==1.21.1
 numpy==2.2.4
+Pillow>=11,<12
+pillow-heif>=0.18,<1

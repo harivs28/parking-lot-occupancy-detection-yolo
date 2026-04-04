@@ -1,12 +1,12 @@
 # ParkVision AI — Parking Lot Occupancy Detection using YOLOv5
 
-A computer vision system that detects empty and occupied parking slots from aerial/camera images using **YOLOv5** object detection. Includes a modern web interface for uploading images and viewing results in real time.
+A computer vision system that detects empty and occupied parking slots from aerial/camera images using **YOLOv5** object detection. The web interface now focuses on a simple upload-or-paste workflow with automatic layout matching and instant annotated results.
 
 <br>
 
 ## Abstract
 
-This project presents a computer vision algorithm for parking lot occupancy detection. It uses **YOLOv5s**, a one-stage deep learning object detector (ONNX format), to detect vehicles in parking lot images. The detected vehicles are then matched against predefined parking slot coordinates to determine which slots are **occupied** (red) and which are **empty** (green).
+This project presents a computer vision algorithm for parking lot occupancy detection. It uses **YOLOv5s**, a one-stage deep learning object detector (ONNX format), to detect vehicles in parking lot images. The detected vehicles are filtered to vehicle classes, deduplicated with non-max suppression, and then matched against predefined parking slot coordinates to determine which slots are **occupied** (red) and which are **empty** (green).
 
 The system is tested on the **CNRPark** dataset — images of the CNR (National Research Council) parking lot in Pisa, Italy. The images span 9 camera viewpoints across different dates, times, and weather conditions (Sunny, Overcast, Rainy), including challenging scenarios with shadows and occlusions.
 
@@ -14,11 +14,11 @@ The system is tested on the **CNRPark** dataset — images of the CNR (National 
 
 ## Features
 
-- 🌐 **Web Interface** — Upload parking lot images via drag-and-drop and get instant results
-- 🤖 **YOLOv5 Detection** — Real-time object detection using YOLOv5s ONNX model
+- 🌐 **Automatic Web Interface** — Upload, drag-and-drop, or paste parking lot images and start detection immediately
+- 🧠 **Auto Layout Matching** — Chooses the closest supported camera profile automatically
+- 🖼️ **Wide Image Support** — Handles common image formats including JPG, PNG, WEBP, TIFF, BMP, GIF, plus HEIC/HEIF through Pillow support
+- 🤖 **Improved YOLOv5 Detection** — Vehicle-class filtering and non-max suppression for cleaner detections
 - 📊 **Occupancy Statistics** — Total, empty, and occupied slot counts with occupancy rate
-- 🎛️ **Adjustable Parameters** — Confidence threshold, overlap threshold, and detection area controls
-- 🖼️ **Sample Gallery** — Pre-loaded images from 9 cameras across 3 weather conditions
 - 📱 **Responsive Design** — Works on desktop and mobile browsers
 
 <br>
@@ -67,6 +67,8 @@ This installs:
 - `opencv-python-headless` — Image processing
 - `onnxruntime` — YOLOv5 ONNX model inference
 - `numpy` — Numerical operations
+- `Pillow` — Broader image-format decoding and EXIF orientation handling
+- `pillow-heif` — HEIC and HEIF decoding support
 
 ### 2. Start the Server
 
@@ -89,34 +91,25 @@ You should see:
 
 Navigate to **http://localhost:5000** and:
 
-1. **Upload** a parking lot image (drag-and-drop or click to browse)
-2. **Select** the camera profile (1–9) matching your image's viewpoint
-3. **Adjust** detection thresholds if needed (defaults work well)
-4. **Click** "Detect Parking Slots"
-5. **View** the annotated result with occupancy statistics
+1. **Upload** a parking lot image by browsing, dragging-and-dropping, or pasting from the clipboard
+2. **Wait** for the app to automatically decode the image and start inference
+3. **Review** the auto-selected parking profile, vehicle count, and occupancy statistics
+4. **Re-run** detection on the same image if needed with the "Analyze Again" button
 
-You can also click any **sample image** from the gallery to quickly test the system.
-
-<br>
-
-## Detection Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Confidence Threshold | 1% | Minimum YOLOv5 detection confidence |
-| Overlap Threshold | 50% | Minimum intersection-over-slot-area to mark as occupied |
-| Detection Area | 5x | Maximum detection-to-slot area ratio |
+The application is designed so users do not need to change manual values before detection starts.
 
 <br>
 
 ## How It Works
 
-1. **Image Input** — The uploaded image is resized to 1000×750 pixels
-2. **YOLOv5 Inference** — A 640×640 blob is passed through YOLOv5s to detect all vehicles
-3. **Slot Matching** — Each predefined parking slot (from CSV) is checked against detections:
-   - If `intersection area ≥ overlap_threshold × slot area` AND `detection area < area_threshold × slot area` → **Occupied** (red box)
-   - Otherwise → **Empty** (green box)
-4. **Output** — Annotated image with colored bounding boxes and yellow slot IDs, plus statistics
+1. **Image Input** — The uploaded image is decoded through Pillow/OpenCV, EXIF orientation is normalized, and the image is resized to 1000×750 pixels
+2. **YOLOv5 Inference** — A letterboxed 640×640 input is passed through YOLOv5s on one or more image variants
+3. **Vehicle Filtering** — Only vehicle classes are retained and duplicate detections are removed with non-max suppression
+4. **Auto Layout Match** — The image is compared against the 9 supported parking-camera layouts and the best matching profile is selected automatically
+5. **Slot Matching** — Each predefined parking slot is checked against vehicle detections using overlap and detection-area rules
+6. **Output** — Annotated image with colored parking-slot boxes, selected profile, and occupancy statistics
+
+The current slot overlays are still based on the 9 CNRPark camera layouts, so best results come from parking-lot views that are visually close to those supported angles.
 
 <br>
 
