@@ -7,6 +7,7 @@ import base64
 import csv
 import os
 import traceback
+from dataclasses import dataclass
 from io import BytesIO
 
 import cv2
@@ -64,13 +65,52 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.18
 DEFAULT_NMS_IOU_THRESHOLD = 0.45
 DEFAULT_SLOT_OVERLAP_THRESHOLD = 0.50
 DEFAULT_DETECTION_AREA_THRESHOLD = 5
+DEFAULT_ANALYSIS_MODE = "auto"
+DEFAULT_DETECTION_SIZE = "auto"
+DEFAULT_EMPTY_SENSITIVITY = 0.35
+DEFAULT_INFER_EDGE_SLOTS = False
+MIN_CONFIDENCE_THRESHOLD = 0.10
+MAX_CONFIDENCE_THRESHOLD = 0.32
 DETECTION_MAX_SIDE = 1920
+DETECTION_UPSCALE_TARGET_SIDE = 1400
+DETECTION_SECONDARY_UPSCALE_TARGET_SIDE = 1900
+DETECTION_MAX_UPSCALE_FACTOR = 4.0
 TILE_SIZE = 768
 TILE_OVERLAP_RATIO = 0.35
 TILE_TRIGGER_DETECTION_COUNT = 12
 TILE_CONFIDENCE_THRESHOLD = 0.12
 LAYOUT_MIN_FEATURE_SCORE = 120.0
 LAYOUT_MIN_FEATURE_RATIO = 3.0
+ROTATION_TRIGGER_DETECTION_COUNT = 8
+UPSCALE_TRIGGER_IMAGE_SIDE = 1100
+UPSCALE_TRIGGER_DETECTION_COUNT = 20
+
+DETECTION_SIZE_PRESETS = {
+    "balanced": {
+        "label": "Balanced",
+        "max_side": DETECTION_MAX_SIDE,
+        "primary_upscale_target": DETECTION_UPSCALE_TARGET_SIDE,
+        "secondary_upscale_target": DETECTION_SECONDARY_UPSCALE_TARGET_SIDE,
+        "upscale_trigger_side": UPSCALE_TRIGGER_IMAGE_SIDE,
+        "upscale_trigger_detection_count": UPSCALE_TRIGGER_DETECTION_COUNT,
+    },
+    "high": {
+        "label": "High detail",
+        "max_side": 2300,
+        "primary_upscale_target": 1800,
+        "secondary_upscale_target": 2500,
+        "upscale_trigger_side": 1400,
+        "upscale_trigger_detection_count": 24,
+    },
+    "max": {
+        "label": "Max detail",
+        "max_side": 2800,
+        "primary_upscale_target": 2100,
+        "secondary_upscale_target": 3000,
+        "upscale_trigger_side": 1650,
+        "upscale_trigger_detection_count": 28,
+    },
+}
 
 VEHICLE_CLASSES = {
     2: "car",
@@ -97,6 +137,17 @@ YELLOW = (0, 255, 255)
 PANEL_BG = (20, 28, 43)
 PANEL_TEXT = (244, 247, 250)
 DETECTION_BOX_COLOR = (255, 191, 0)
+
+
+@dataclass(frozen=True)
+class DetectionSettings:
+    """User-adjustable detection and layout controls sent from the UI."""
+
+    analysis_mode: str = DEFAULT_ANALYSIS_MODE
+    detection_size: str = DEFAULT_DETECTION_SIZE
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
+    empty_sensitivity: float = DEFAULT_EMPTY_SENSITIVITY
+    infer_edge_slots: bool = DEFAULT_INFER_EDGE_SLOTS
 
 
 # ── Load YOLO Model (once at startup) ───────────────────────────────────────
@@ -149,6 +200,126 @@ def resize_to_display(image: np.ndarray) -> np.ndarray:
     )
 
 
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    """Clamp a numeric value into the given range."""
+    return max(min_value, min(value, max_value))
+
+
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    """Parse a checkbox-like form value."""
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_float_value(
+    raw_value: str | None,
+    *,
+    default: float,
+    min_value: float,
+    max_value: float,
+) -> float:
+    """Parse and clamp a float form value."""
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    return clamp(float(raw_value), min_value, max_value)
+
+
+def parse_analysis_mode(raw_value: str | None) -> str:
+    """Normalize the requested analysis mode."""
+    normalized_value = (raw_value or DEFAULT_ANALYSIS_MODE).strip().lower()
+    if normalized_value not in {"auto", "fixed", "generic"}:
+        raise ValueError("Analysis mode must be auto, fixed, or generic.")
+    return normalized_value
+
+
+def parse_detection_size(raw_value: str | None) -> str:
+    """Normalize the requested detection detail preset."""
+    normalized_value = (raw_value or DEFAULT_DETECTION_SIZE).strip().lower()
+    if normalized_value not in {"auto", *DETECTION_SIZE_PRESETS.keys()}:
+        raise ValueError("Detection size must be auto, balanced, high, or max.")
+    return normalized_value
+
+
+def resolve_detection_profile(
+    detection_size: str,
+    image_shape: tuple[int, int, int],
+) -> dict:
+    """Choose the effective detection-resolution profile for this image."""
+    requested_level = detection_size if detection_size != "auto" else DEFAULT_DETECTION_SIZE
+    if detection_size == "auto":
+        image_height, image_width = image_shape[:2]
+        largest_side = max(image_height, image_width)
+        megapixels = (image_height * image_width) / 1_000_000.0
+        if largest_side <= 720 or megapixels <= 0.55:
+            resolved_level = "max"
+        elif largest_side <= 1100 or megapixels <= 1.20:
+            resolved_level = "high"
+        else:
+            resolved_level = "balanced"
+    else:
+        resolved_level = detection_size
+
+    profile = dict(DETECTION_SIZE_PRESETS[resolved_level])
+    profile["requested_level"] = requested_level
+    profile["resolved_level"] = resolved_level
+    profile["display_label"] = (
+        f"Auto -> {profile['label']}" if detection_size == "auto" else profile["label"]
+    )
+    return profile
+
+
+def describe_empty_sensitivity(empty_sensitivity: float) -> str:
+    """Return a short user-facing label for generic empty-slot aggressiveness."""
+    if empty_sensitivity <= 0.35:
+        return "Conservative"
+    if empty_sensitivity <= 0.65:
+        return "Balanced"
+    return "Aggressive"
+
+
+def parse_detection_settings(form_data) -> tuple[int | None, DetectionSettings]:
+    """Parse analysis controls from the request form."""
+    analysis_mode = parse_analysis_mode(form_data.get("analysis_mode"))
+    detection_size = parse_detection_size(form_data.get("detection_size"))
+    confidence_threshold = parse_float_value(
+        form_data.get("confidence_threshold"),
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        min_value=MIN_CONFIDENCE_THRESHOLD,
+        max_value=MAX_CONFIDENCE_THRESHOLD,
+    )
+    empty_sensitivity_percent = parse_float_value(
+        form_data.get("empty_sensitivity"),
+        default=DEFAULT_EMPTY_SENSITIVITY * 100.0,
+        min_value=0.0,
+        max_value=100.0,
+    )
+    infer_edge_slots = parse_bool(
+        form_data.get("infer_edge_slots"),
+        default=DEFAULT_INFER_EDGE_SLOTS,
+    )
+
+    requested_camera = None
+    raw_camera_value = (form_data.get("camera", "auto") or "auto").strip().lower()
+    if analysis_mode == "fixed":
+        if raw_camera_value and raw_camera_value != "auto":
+            requested_camera = int(raw_camera_value)
+        else:
+            requested_camera = DEFAULT_CAMERA_NUMBER
+
+        if requested_camera not in SUPPORTED_CAMERA_NUMBERS:
+            raise ValueError("Camera number must be 1–9 when fixed profile mode is used.")
+
+    settings = DetectionSettings(
+        analysis_mode=analysis_mode,
+        detection_size=detection_size,
+        confidence_threshold=confidence_threshold,
+        empty_sensitivity=empty_sensitivity_percent / 100.0,
+        infer_edge_slots=infer_edge_slots,
+    )
+    return requested_camera, settings
+
+
 def resize_for_detection(
     image: np.ndarray,
     max_side: int = DETECTION_MAX_SIDE,
@@ -167,6 +338,87 @@ def resize_for_detection(
         (resized_width, resized_height),
         interpolation=cv2.INTER_AREA,
     )
+
+
+def compute_image_quality_metrics(image: np.ndarray) -> tuple[float, float]:
+    """Return blur and contrast scores used to adapt image enhancement."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    contrast_score = float(gray.std())
+    return blur_score, contrast_score
+
+
+def enhance_detection_input(image: np.ndarray) -> np.ndarray:
+    """Improve low-quality images before running the detector."""
+    blur_score, contrast_score = compute_image_quality_metrics(image)
+    enhanced_image = image.copy()
+
+    if contrast_score < 55.0:
+        lab_image = cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab_image)
+        clip_limit = 3.2 if contrast_score < 35.0 else 2.4
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        equalized_l = clahe.apply(l_channel)
+        enhanced_image = cv2.cvtColor(
+            cv2.merge((equalized_l, a_channel, b_channel)),
+            cv2.COLOR_LAB2BGR,
+        )
+
+    if blur_score < 90.0:
+        enhanced_image = cv2.detailEnhance(enhanced_image, sigma_s=8, sigma_r=0.15)
+
+    if blur_score < 130.0 or contrast_score < 48.0:
+        sharpen_strength = 0.30 if blur_score < 90.0 else 0.22
+        enhanced_image = cv2.addWeighted(
+            enhanced_image,
+            1.0 + sharpen_strength,
+            cv2.GaussianBlur(enhanced_image, (0, 0), 1.4),
+            -sharpen_strength,
+            0,
+        )
+
+    if contrast_score < 28.0:
+        enhanced_image = cv2.convertScaleAbs(enhanced_image, alpha=1.10, beta=8)
+
+    return enhanced_image
+
+
+def build_upscaled_detection_views(
+    image: np.ndarray,
+    detection_profile: dict,
+) -> list[tuple[np.ndarray, float]]:
+    """Create extra high-resolution views for tiny vehicles in low-quality uploads."""
+    image_height, image_width = image.shape[:2]
+    largest_side = max(image_height, image_width)
+
+    scale_targets = []
+    if largest_side < detection_profile["upscale_trigger_side"]:
+        scale_targets.append(detection_profile["primary_upscale_target"])
+    if largest_side < detection_profile["primary_upscale_target"] * 0.75:
+        scale_targets.append(detection_profile["secondary_upscale_target"])
+
+    scaled_views = []
+    seen_scales = {1.0}
+    for target_side in scale_targets:
+        scale = min(target_side / float(largest_side), DETECTION_MAX_UPSCALE_FACTOR)
+        if scale <= 1.05:
+            continue
+
+        rounded_scale = round(scale, 2)
+        if rounded_scale in seen_scales:
+            continue
+        seen_scales.add(rounded_scale)
+
+        resized_width = max(1, int(round(image_width * scale)))
+        resized_height = max(1, int(round(image_height * scale)))
+        scaled_image = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+        scaled_views.append((enhance_detection_input(scaled_image), scale))
+
+    return scaled_views
 
 
 def decode_image(image_bytes: bytes) -> tuple[np.ndarray, str]:
@@ -516,12 +768,110 @@ def run_yolo_on_region(
     return region_detections
 
 
-def run_vehicle_detection(
+def restore_bbox_from_rotation(
+    bbox: tuple[int, int, int, int],
+    original_shape: tuple[int, int, int],
+    rotation_code: int | None,
+) -> tuple[int, int, int, int]:
+    """Map a detection bbox from a rotated image back to the original image."""
+    if rotation_code is None:
+        return bbox
+
+    left, top, width, height = bbox
+    image_height, image_width = original_shape[:2]
+    corners = [
+        (left, top),
+        (left + width, top),
+        (left + width, top + height),
+        (left, top + height),
+    ]
+
+    restored_corners = []
+    for x_pos, y_pos in corners:
+        if rotation_code == cv2.ROTATE_90_CLOCKWISE:
+            restored_x = y_pos
+            restored_y = image_height - x_pos
+        elif rotation_code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+            restored_x = image_width - y_pos
+            restored_y = x_pos
+        elif rotation_code == cv2.ROTATE_180:
+            restored_x = image_width - x_pos
+            restored_y = image_height - y_pos
+        else:  # pragma: no cover - defensive fallback
+            restored_x = x_pos
+            restored_y = y_pos
+
+        restored_corners.append((restored_x, restored_y))
+
+    xs = [point[0] for point in restored_corners]
+    ys = [point[1] for point in restored_corners]
+
+    restored_left = int(max(0, min(round(min(xs)), image_width - 1)))
+    restored_top = int(max(0, min(round(min(ys)), image_height - 1)))
+    restored_right = int(max(restored_left + 1, min(round(max(xs)), image_width)))
+    restored_bottom = int(max(restored_top + 1, min(round(max(ys)), image_height)))
+    return (
+        restored_left,
+        restored_top,
+        restored_right - restored_left,
+        restored_bottom - restored_top,
+    )
+
+
+def run_rotated_region_detections(
     image: np.ndarray,
-    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-    iou_threshold: float = DEFAULT_NMS_IOU_THRESHOLD,
+    confidence_threshold: float,
 ) -> list[dict]:
-    """Run YOLOv5 inference and return deduplicated vehicle detections."""
+    """Run detection on rotated views and map boxes back into the original image."""
+    rotated_detections = []
+    for rotation_code in [
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_180,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    ]:
+        rotated_image = cv2.rotate(image, rotation_code)
+        detections = run_yolo_on_region(rotated_image, confidence_threshold)
+        for detection in detections:
+            rotated_detections.append(
+                {
+                    **detection,
+                    "bbox": restore_bbox_from_rotation(
+                        detection["bbox"],
+                        image.shape,
+                        rotation_code,
+                    ),
+                }
+            )
+
+    return rotated_detections
+
+
+def rescale_detections(detections: list[dict], inverse_scale: float) -> list[dict]:
+    """Project detections from an upscaled view back into the base image space."""
+    scaled_detections = []
+    for detection in detections:
+        left, top, width, height = detection["bbox"]
+        scaled_detections.append(
+            {
+                **detection,
+                "bbox": (
+                    int(round(left * inverse_scale)),
+                    int(round(top * inverse_scale)),
+                    max(1, int(round(width * inverse_scale))),
+                    max(1, int(round(height * inverse_scale))),
+                ),
+            }
+        )
+
+    return scaled_detections
+
+
+def run_vehicle_detection_on_single_view(
+    image: np.ndarray,
+    confidence_threshold: float,
+    iou_threshold: float,
+) -> list[dict]:
+    """Run the base detector stack on one image resolution."""
     global_detections = run_yolo_on_region(image, confidence_threshold)
     deduplicated_global_detections = apply_non_max_suppression(
         global_detections,
@@ -530,6 +880,19 @@ def run_vehicle_detection(
     )
 
     all_detections = list(global_detections)
+    if len(deduplicated_global_detections) < ROTATION_TRIGGER_DETECTION_COUNT:
+        all_detections.extend(
+            run_rotated_region_detections(
+                image,
+                confidence_threshold,
+            )
+        )
+        deduplicated_global_detections = apply_non_max_suppression(
+            all_detections,
+            confidence_threshold,
+            iou_threshold,
+        )
+
     if (
         max(image.shape[:2]) >= TILE_SIZE
         and len(deduplicated_global_detections) < TILE_TRIGGER_DETECTION_COUNT
@@ -546,6 +909,43 @@ def run_vehicle_detection(
     return apply_non_max_suppression(
         all_detections,
         min(confidence_threshold, TILE_CONFIDENCE_THRESHOLD),
+        iou_threshold,
+    )
+
+
+def run_vehicle_detection(
+    image: np.ndarray,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    iou_threshold: float = DEFAULT_NMS_IOU_THRESHOLD,
+    detection_profile: dict | None = None,
+) -> list[dict]:
+    """Run YOLOv5 inference and return deduplicated vehicle detections."""
+    if detection_profile is None:
+        detection_profile = resolve_detection_profile(DEFAULT_DETECTION_SIZE, image.shape)
+
+    base_detections = run_vehicle_detection_on_single_view(
+        image,
+        confidence_threshold,
+        iou_threshold,
+    )
+
+    all_detections = list(base_detections)
+    if (
+        max(image.shape[:2]) < detection_profile["upscale_trigger_side"]
+        or len(base_detections) < detection_profile["upscale_trigger_detection_count"]
+    ):
+        auxiliary_confidence = max(0.10, confidence_threshold - 0.04)
+        for upscaled_image, scale in build_upscaled_detection_views(image, detection_profile):
+            auxiliary_detections = run_vehicle_detection_on_single_view(
+                upscaled_image,
+                auxiliary_confidence,
+                iou_threshold,
+            )
+            all_detections.extend(rescale_detections(auxiliary_detections, 1.0 / scale))
+
+    return apply_non_max_suppression(
+        all_detections,
+        max(0.10, confidence_threshold - 0.04),
         iou_threshold,
     )
 
@@ -661,6 +1061,498 @@ def scale_detections_to_display(
     return scaled
 
 
+def get_detection_center(detection: dict) -> tuple[float, float]:
+    left, top, width, height = detection["bbox"]
+    return left + (width / 2.0), top + (height / 2.0)
+
+
+def project_bbox_to_angle(width: float, height: float, angle_rad: float) -> tuple[float, float]:
+    """Project an axis-aligned box onto a rotated along/cross coordinate system."""
+    cos_angle = abs(np.cos(angle_rad))
+    sin_angle = abs(np.sin(angle_rad))
+    along_size = (width * cos_angle) + (height * sin_angle)
+    cross_size = (width * sin_angle) + (height * cos_angle)
+    return along_size, cross_size
+
+
+def rotate_point(
+    x: float,
+    y: float,
+    angle_rad: float,
+    origin: tuple[float, float],
+) -> tuple[float, float]:
+    """Rotate a point around an origin."""
+    origin_x, origin_y = origin
+    translated_x = x - origin_x
+    translated_y = y - origin_y
+    rotated_x = (translated_x * np.cos(angle_rad)) - (translated_y * np.sin(angle_rad))
+    rotated_y = (translated_x * np.sin(angle_rad)) + (translated_y * np.cos(angle_rad))
+    return rotated_x + origin_x, rotated_y + origin_y
+
+
+def estimate_candidate_row_angles(
+    detections: list[dict],
+    image_shape: tuple[int, int, int],
+) -> list[float]:
+    """Estimate likely parking-row directions from detection centers."""
+    if len(detections) < 2:
+        return [0.0, 90.0]
+
+    centers = np.array([get_detection_center(detection) for detection in detections], dtype=np.float32)
+    short_sides = np.array(
+        [min(detection["bbox"][2], detection["bbox"][3]) for detection in detections],
+        dtype=np.float32,
+    )
+    minimum_distance = max(18.0, float(np.median(short_sides) * 0.75))
+    maximum_distance = max(image_shape[:2]) * 0.45
+
+    angles = []
+    for index, center in enumerate(centers):
+        distances = np.linalg.norm(centers - center, axis=1)
+        neighbor_indices = np.argsort(distances)[1:5]
+        for neighbor_index in neighbor_indices:
+            distance = float(distances[neighbor_index])
+            if distance < minimum_distance or distance > maximum_distance:
+                continue
+
+            delta_x = centers[neighbor_index][0] - center[0]
+            delta_y = centers[neighbor_index][1] - center[1]
+            angle = float(np.degrees(np.arctan2(delta_y, delta_x)) % 180.0)
+            angles.append(angle)
+
+    if not angles:
+        return [0.0, 90.0]
+
+    histogram, edges = np.histogram(angles, bins=36, range=(0.0, 180.0))
+    dominant_index = int(np.argmax(histogram))
+    dominant_angle = float((edges[dominant_index] + edges[dominant_index + 1]) / 2.0)
+
+    candidate_angles = []
+    for angle in [dominant_angle, (dominant_angle + 90.0) % 180.0, 0.0, 90.0]:
+        is_new_angle = True
+        for existing_angle in candidate_angles:
+            angular_distance = abs(((angle - existing_angle + 90.0) % 180.0) - 90.0)
+            if angular_distance < 7.5:
+                is_new_angle = False
+                break
+
+        if is_new_angle:
+            candidate_angles.append(angle)
+
+    return candidate_angles
+
+
+def build_oriented_slot_bbox(
+    center_u: float,
+    center_v: float,
+    along_span: float,
+    cross_span: float,
+    row_angle_rad: float,
+    origin: tuple[float, float],
+    image_shape: tuple[int, int, int],
+) -> tuple[int, int, int, int]:
+    """Convert an oriented slot in rotated space back to an axis-aligned image bbox."""
+    half_along = along_span / 2.0
+    half_cross = cross_span / 2.0
+    rotated_corners = [
+        (center_u - half_along, center_v - half_cross),
+        (center_u + half_along, center_v - half_cross),
+        (center_u + half_along, center_v + half_cross),
+        (center_u - half_along, center_v + half_cross),
+    ]
+    image_corners = [
+        rotate_point(corner_u, corner_v, row_angle_rad, origin)
+        for corner_u, corner_v in rotated_corners
+    ]
+
+    xs = [point[0] for point in image_corners]
+    ys = [point[1] for point in image_corners]
+    image_height, image_width = image_shape[:2]
+
+    left = int(max(0, min(round(min(xs)), image_width - 1)))
+    top = int(max(0, min(round(min(ys)), image_height - 1)))
+    right = int(max(left + 1, min(round(max(xs)), image_width)))
+    bottom = int(max(top + 1, min(round(max(ys)), image_height)))
+
+    return left, top, right - left, bottom - top
+
+
+def build_generic_layout_for_angle(
+    detections: list[dict],
+    image_shape: tuple[int, int, int],
+    row_angle_deg: float,
+    empty_sensitivity: float = DEFAULT_EMPTY_SENSITIVITY,
+    infer_edge_slots: bool = DEFAULT_INFER_EDGE_SLOTS,
+) -> tuple[list, dict, float]:
+    """Estimate parking slots for a general parking image given a row angle."""
+    if len(detections) < 2:
+        return [], {}, 0.0
+
+    row_angle_rad = float(np.radians(row_angle_deg))
+    alignment_rotation = -row_angle_rad
+    origin = (image_shape[1] / 2.0, image_shape[0] / 2.0)
+
+    aligned_entries = []
+    for detection_index, detection in enumerate(detections):
+        center_x, center_y = get_detection_center(detection)
+        aligned_u, aligned_v = rotate_point(center_x, center_y, alignment_rotation, origin)
+        along_size, cross_size = project_bbox_to_angle(
+            detection["bbox"][2],
+            detection["bbox"][3],
+            row_angle_rad,
+        )
+        aligned_entries.append(
+            {
+                "index": detection_index,
+                "detection": detection,
+                "u": aligned_u,
+                "v": aligned_v,
+                "along_size": along_size,
+                "cross_size": cross_size,
+            }
+        )
+
+    cross_sizes = [entry["cross_size"] for entry in aligned_entries]
+    band_threshold = max(18.0, float(np.median(cross_sizes) * 0.8))
+    sorted_entries = sorted(aligned_entries, key=lambda entry: entry["v"])
+
+    row_clusters = []
+    current_cluster = [sorted_entries[0]]
+    for entry in sorted_entries[1:]:
+        current_band = float(np.median([cluster_entry["v"] for cluster_entry in current_cluster]))
+        if abs(entry["v"] - current_band) <= band_threshold:
+            current_cluster.append(entry)
+        else:
+            row_clusters.append(current_cluster)
+            current_cluster = [entry]
+    row_clusters.append(current_cluster)
+
+    image_corners = [
+        rotate_point(0.0, 0.0, alignment_rotation, origin),
+        rotate_point(float(image_shape[1]), 0.0, alignment_rotation, origin),
+        rotate_point(0.0, float(image_shape[0]), alignment_rotation, origin),
+        rotate_point(float(image_shape[1]), float(image_shape[0]), alignment_rotation, origin),
+    ]
+    rotated_min_u = min(point[0] for point in image_corners)
+    rotated_max_u = max(point[0] for point in image_corners)
+
+    parking_lots = []
+    slot_details = []
+    occupied_count = 0
+    empty_count = 0
+    inferred_empty_count = 0
+    used_detection_indices = set()
+    rows_with_multiple_cars = 0
+    conservative_gap_factor = 1.95 - (empty_sensitivity * 0.55)
+    min_row_support_for_empty_slots = 3 if empty_sensitivity < 0.75 else 2
+    max_inferred_slots_per_gap = 1 if empty_sensitivity < 0.55 else 2
+
+    for row_index, cluster in enumerate(row_clusters, start=1):
+        if len(cluster) >= 2:
+            rows_with_multiple_cars += 1
+
+        ordered_cluster = sorted(cluster, key=lambda entry: entry["u"])
+        row_v = float(np.median([entry["v"] for entry in ordered_cluster]))
+        along_sizes = [entry["along_size"] for entry in ordered_cluster]
+        cross_sizes = [entry["cross_size"] for entry in ordered_cluster]
+        along_positions = [entry["u"] for entry in ordered_cluster]
+
+        median_along = float(np.median(along_sizes))
+        median_cross = float(np.median(cross_sizes))
+        consecutive_gaps = np.diff(along_positions)
+        valid_gaps = [
+            float(gap)
+            for gap in consecutive_gaps
+            if gap >= max(12.0, median_along * 0.55)
+        ]
+
+        if valid_gaps:
+            pitch = float(np.percentile(valid_gaps, 35))
+            pitch = float(np.clip(pitch, median_along * 0.85, median_along * 3.0))
+        else:
+            pitch = median_along * 1.25
+
+        slot_along_span = max(median_along * 1.08, pitch * 0.90)
+        slot_cross_span = median_cross * 1.22
+        row_span = ordered_cluster[-1]["u"] - ordered_cluster[0]["u"]
+        row_inferred_empty_count = 0
+        max_row_inferred_slots = max(
+            1,
+            min(
+                3,
+                int(round((empty_sensitivity * 2.0) + (len(ordered_cluster) / 3.0))),
+            ),
+        )
+        can_infer_row_empties = (
+            len(ordered_cluster) >= min_row_support_for_empty_slots
+            and row_span >= pitch * 1.75
+        )
+
+        for slot_index, entry in enumerate(ordered_cluster, start=1):
+            used_detection_indices.add(entry["index"])
+            parking_lots.append(
+                {
+                    "slot_id": "",
+                    "bbox": build_oriented_slot_bbox(
+                        entry["u"],
+                        row_v,
+                        slot_along_span,
+                        slot_cross_span,
+                        row_angle_rad,
+                        origin,
+                        image_shape,
+                    ),
+                    "estimated": True,
+                    "row": row_index,
+                }
+            )
+            slot_details.append(
+                {
+                    "slot_id": "",
+                    "occupied": True,
+                    "overlap_ratio": 0.0,
+                }
+            )
+            occupied_count += 1
+
+            if slot_index < len(ordered_cluster):
+                next_entry = ordered_cluster[slot_index]
+                gap = next_entry["u"] - entry["u"]
+                slot_steps = int(round(gap / max(pitch, 1.0)))
+                if (
+                    can_infer_row_empties
+                    and slot_steps >= 2
+                    and gap > pitch * conservative_gap_factor
+                    and row_inferred_empty_count < max_row_inferred_slots
+                ):
+                    missing_slots = min(
+                        slot_steps - 1,
+                        max_inferred_slots_per_gap,
+                        max_row_inferred_slots - row_inferred_empty_count,
+                    )
+                    if missing_slots <= 0:
+                        continue
+
+                    interpolated_step = gap / float(missing_slots + 1)
+                    for missing_index in range(1, missing_slots + 1):
+                        missing_u = entry["u"] + (interpolated_step * missing_index)
+                        parking_lots.append(
+                            {
+                                "slot_id": "",
+                                "bbox": build_oriented_slot_bbox(
+                                    missing_u,
+                                    row_v,
+                                    slot_along_span,
+                                    slot_cross_span,
+                                    row_angle_rad,
+                                    origin,
+                                    image_shape,
+                                ),
+                                "estimated": True,
+                                "row": row_index,
+                            }
+                        )
+                        slot_details.append(
+                            {
+                                "slot_id": "",
+                                "occupied": False,
+                                "overlap_ratio": 0.0,
+                            }
+                        )
+                        empty_count += 1
+                        inferred_empty_count += 1
+                        row_inferred_empty_count += 1
+
+        if (
+            infer_edge_slots
+            and can_infer_row_empties
+            and len(ordered_cluster) >= 3
+            and row_inferred_empty_count < max_row_inferred_slots
+        ):
+            first_u = ordered_cluster[0]["u"]
+            last_u = ordered_cluster[-1]["u"]
+            available_edge_slots = min(
+                2,
+                max_row_inferred_slots - row_inferred_empty_count,
+            )
+            for edge_u in [first_u - pitch, last_u + pitch][:available_edge_slots]:
+                if rotated_min_u + (pitch * 0.35) <= edge_u <= rotated_max_u - (pitch * 0.35):
+                    parking_lots.append(
+                        {
+                            "slot_id": "",
+                            "bbox": build_oriented_slot_bbox(
+                                edge_u,
+                                row_v,
+                                slot_along_span,
+                                slot_cross_span,
+                                row_angle_rad,
+                                origin,
+                                image_shape,
+                            ),
+                            "estimated": True,
+                            "row": row_index,
+                        }
+                    )
+                    slot_details.append(
+                        {
+                            "slot_id": "",
+                            "occupied": False,
+                            "overlap_ratio": 0.0,
+                        }
+                    )
+                    empty_count += 1
+                    inferred_empty_count += 1
+                    row_inferred_empty_count += 1
+
+    for detection_index, detection in enumerate(detections):
+        if detection_index in used_detection_indices:
+            continue
+
+        left, top, width, height = detection["bbox"]
+        padding_x = max(4, int(round(width * 0.12)))
+        padding_y = max(4, int(round(height * 0.12)))
+        parking_lots.append(
+            {
+                "slot_id": "",
+                "bbox": (
+                    max(0, left - padding_x),
+                    max(0, top - padding_y),
+                    min(image_shape[1] - max(0, left - padding_x), width + (padding_x * 2)),
+                    min(image_shape[0] - max(0, top - padding_y), height + (padding_y * 2)),
+                ),
+                "estimated": True,
+                "row": None,
+            }
+        )
+        slot_details.append(
+            {
+                "slot_id": "",
+                "occupied": True,
+                "overlap_ratio": 0.0,
+            }
+        )
+        occupied_count += 1
+
+    total_slots = occupied_count + empty_count
+    effective_inferred_empty_count = min(
+        inferred_empty_count,
+        max(0, rows_with_multiple_cars * max(1, max_inferred_slots_per_gap)),
+    )
+    stats = {
+        "total": total_slots,
+        "occupied": occupied_count,
+        "empty": empty_count,
+        "occupancy_rate": round((occupied_count / max(1, total_slots)) * 100.0, 1),
+        "matched_detections": occupied_count,
+        "mean_overlap": 0.0,
+        "slots": slot_details,
+        "camera": None,
+        "camera_label": "Estimated layout",
+        "camera_mode": "generic_estimate",
+        "camera_match_score": 0.0,
+        "selection_score": round(
+            rows_with_multiple_cars + (effective_inferred_empty_count * 0.08),
+            3,
+        ),
+        "layout_supported": True,
+        "slot_mode": "estimated",
+        "warning_message": (
+            "Estimated slot layout generated from detected vehicles for this parking-lot image."
+        ),
+        "estimated_row_angle": round(row_angle_deg, 1),
+    }
+
+    score = (
+        rows_with_multiple_cars * 4.5
+        + occupied_count * 1.6
+        + effective_inferred_empty_count * (0.25 + (empty_sensitivity * 0.25))
+    )
+    return parking_lots, stats, score
+
+
+def infer_generic_parking_layout(
+    detections: list[dict],
+    image_shape: tuple[int, int, int],
+    settings: DetectionSettings | None = None,
+) -> tuple[list, dict]:
+    """Estimate parking slots for arbitrary parking-lot images."""
+    if settings is None:
+        settings = DetectionSettings()
+
+    if not detections:
+        return [], {
+            "camera": None,
+            "camera_label": "Vehicle detections only",
+            "camera_mode": "vehicle_only",
+            "camera_match_score": 0.0,
+            "selection_score": 0.0,
+            "layout_supported": False,
+            "slot_mode": "vehicle_only",
+            "warning_message": (
+                "No supported parking layout was found and there were not enough vehicle "
+                "detections to estimate parking slots automatically."
+            ),
+            "total": 0,
+            "occupied": 0,
+            "empty": 0,
+            "occupancy_rate": 0.0,
+            "matched_detections": 0,
+            "mean_overlap": 0.0,
+            "slots": [],
+        }
+
+    best_candidate = None
+    for candidate_angle in estimate_candidate_row_angles(detections, image_shape):
+        parking_lots, stats, score = build_generic_layout_for_angle(
+            detections,
+            image_shape,
+            candidate_angle,
+            empty_sensitivity=settings.empty_sensitivity,
+            infer_edge_slots=settings.infer_edge_slots,
+        )
+        if best_candidate is None or score > best_candidate[2]:
+            best_candidate = (parking_lots, stats, score)
+
+    if best_candidate is None or best_candidate[2] < 6.0:
+        return [], {
+            "camera": None,
+            "camera_label": "Vehicle detections only",
+            "camera_mode": "vehicle_only",
+            "camera_match_score": 0.0,
+            "selection_score": 0.0,
+            "layout_supported": False,
+            "slot_mode": "vehicle_only",
+            "warning_message": (
+                "Detected vehicles were not arranged clearly enough to estimate parking slots "
+                "for this image. Showing vehicle detections only."
+            ),
+            "total": 0,
+            "occupied": 0,
+            "empty": 0,
+            "occupancy_rate": 0.0,
+            "matched_detections": 0,
+            "mean_overlap": 0.0,
+            "slots": [],
+        }
+
+    return best_candidate[0], best_candidate[1]
+
+
+def describe_result_mode(slot_mode: str, requested_analysis_mode: str) -> str:
+    """Return a concise label describing how the final result was produced."""
+    if slot_mode == "manual":
+        return "Manual fixed profile"
+    if slot_mode == "fixed":
+        return "Auto matched" if requested_analysis_mode == "auto" else "Fixed profile"
+    if slot_mode == "estimated":
+        return (
+            "Auto -> Generic estimate"
+            if requested_analysis_mode == "auto"
+            else "Generic estimate"
+        )
+    return "Vehicle only"
+
+
 def select_best_camera(
     image: np.ndarray,
     detections: list,
@@ -684,7 +1576,15 @@ def select_best_camera(
                 "camera_match_score": 0.0,
                 "selection_score": 1.0,
                 "layout_supported": True,
-                "warning_message": "",
+                "slot_mode": "manual",
+                "warning_message": (
+                    ""
+                    if selected_layout["matched_detections"] > 0
+                    else (
+                        f"Camera {requested_camera} was forced manually. "
+                        "Switch to Auto or Generic estimate if this is a different parking layout."
+                    )
+                ),
             }
         )
         return requested_camera, PARKING_LOTS[requested_camera], selected_layout
@@ -739,6 +1639,7 @@ def select_best_camera(
             "camera_match_score": 0.0,
             "selection_score": 0.0,
             "layout_supported": False,
+            "slot_mode": "vehicle_only",
             "warning_message": (
                 "This image does not match any built-in parking layout closely enough "
                 "for reliable slot occupancy. Showing vehicle detections only."
@@ -775,6 +1676,7 @@ def select_best_camera(
             "camera_match_score": round(feature_score, 2),
             "selection_score": round(selection_score, 3),
             "layout_supported": layout_supported,
+            "slot_mode": "fixed" if layout_supported else "vehicle_only",
             "warning_message": warning_message,
         }
     )
@@ -801,16 +1703,17 @@ def draw_parking_lots(image: np.ndarray, parking_lots: list, slot_details: list)
         color = RED if is_occupied else GREEN
 
         cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(
-            image,
-            parking_lot["slot_id"],
-            (x, max(12, y - 2)),
-            cv2.FONT_HERSHEY_COMPLEX_SMALL,
-            0.55,
-            YELLOW,
-            1,
-            cv2.LINE_AA,
-        )
+        if parking_lot["slot_id"]:
+            cv2.putText(
+                image,
+                parking_lot["slot_id"],
+                (x, max(12, y - 2)),
+                cv2.FONT_HERSHEY_COMPLEX_SMALL,
+                0.55,
+                YELLOW,
+                1,
+                cv2.LINE_AA,
+            )
 
     return image
 
@@ -867,29 +1770,63 @@ def encode_image_to_base64(image: np.ndarray) -> str:
     return base64.b64encode(buffer).decode("utf-8")
 
 
-def process_image(image_bytes: bytes, requested_camera: int | None = None) -> tuple[str, str, dict]:
+def process_image(
+    image_bytes: bytes,
+    requested_camera: int | None = None,
+    settings: DetectionSettings | None = None,
+) -> tuple[str, str, dict]:
     """Full detection pipeline: image bytes → annotated image + stats."""
+    if settings is None:
+        settings = DetectionSettings()
+
     image, input_format = decode_image(image_bytes)
-    detection_image = resize_for_detection(image)
+    detection_profile = resolve_detection_profile(settings.detection_size, image.shape)
+    detection_image = resize_for_detection(
+        image,
+        max_side=detection_profile["max_side"],
+    )
     display_image = resize_to_display(image)
 
-    detections = run_vehicle_detection(detection_image)
+    detections = run_vehicle_detection(
+        detection_image,
+        confidence_threshold=settings.confidence_threshold,
+        detection_profile=detection_profile,
+    )
     display_detections = scale_detections_to_display(
         detections,
         source_shape=detection_image.shape,
         target_shape=display_image.shape,
     )
 
-    selected_camera, parking_lots, stats = select_best_camera(
-        image=display_image,
-        detections=display_detections,
-        requested_camera=requested_camera,
-        overlap_threshold=DEFAULT_SLOT_OVERLAP_THRESHOLD,
-        detection_area_threshold=DEFAULT_DETECTION_AREA_THRESHOLD,
-    )
+    if settings.analysis_mode == "generic":
+        selected_camera = None
+        parking_lots, stats = infer_generic_parking_layout(
+            display_detections,
+            display_image.shape,
+            settings=settings,
+        )
+    else:
+        selected_camera, parking_lots, stats = select_best_camera(
+            image=display_image,
+            detections=display_detections,
+            requested_camera=requested_camera,
+            overlap_threshold=DEFAULT_SLOT_OVERLAP_THRESHOLD,
+            detection_area_threshold=DEFAULT_DETECTION_AREA_THRESHOLD,
+        )
+
+        if settings.analysis_mode == "auto" and stats["slot_mode"] == "vehicle_only":
+            parking_lots, generic_stats = infer_generic_parking_layout(
+                display_detections,
+                display_image.shape,
+                settings=settings,
+            )
+            if generic_stats["slot_mode"] != "vehicle_only":
+                stats = generic_stats
+            else:
+                stats["warning_message"] = generic_stats["warning_message"]
 
     annotated_image = display_image.copy()
-    if stats["layout_supported"]:
+    if stats["slot_mode"] in {"fixed", "manual", "estimated"}:
         annotated_image = draw_parking_lots(annotated_image, parking_lots, stats["slots"])
     annotated_image = draw_vehicle_detections(annotated_image, display_detections)
     annotated_image = draw_result_header(
@@ -897,8 +1834,8 @@ def process_image(image_bytes: bytes, requested_camera: int | None = None) -> tu
         stats["camera_label"],
         (
             f"Vehicles detected: {len(display_detections)}"
-            if stats["layout_supported"]
-            else "Layout unsupported: showing vehicle detections only"
+            if stats["slot_mode"] in {"fixed", "manual", "estimated"}
+            else "Layout could not be estimated: showing vehicle detections only"
         ),
     )
 
@@ -908,7 +1845,25 @@ def process_image(image_bytes: bytes, requested_camera: int | None = None) -> tu
             "input_format": input_format,
             "image_size": f"{display_image.shape[1]}x{display_image.shape[0]}",
             "selected_camera": selected_camera,
-            "auto_profile": requested_camera is None,
+            "auto_profile": settings.analysis_mode == "auto" and requested_camera is None,
+            "analysis_mode_requested": settings.analysis_mode,
+            "analysis_mode_label": {
+                "auto": "Auto",
+                "fixed": "Fixed profile",
+                "generic": "Generic estimate",
+            }[settings.analysis_mode],
+            "result_mode_label": describe_result_mode(
+                stats["slot_mode"],
+                settings.analysis_mode,
+            ),
+            "detection_size_requested": settings.detection_size,
+            "detection_profile_label": detection_profile["display_label"],
+            "confidence_threshold": round(settings.confidence_threshold, 2),
+            "empty_sensitivity": int(round(settings.empty_sensitivity * 100.0)),
+            "empty_sensitivity_label": describe_empty_sensitivity(
+                settings.empty_sensitivity
+            ),
+            "infer_edge_slots": settings.infer_edge_slots,
         }
     )
 
@@ -960,12 +1915,10 @@ def detect():
         if file.filename == "":
             return jsonify({"error": "No file selected."}), 400
 
-        requested_camera = None
-        raw_camera_value = request.form.get("camera", "auto").strip().lower()
-        if raw_camera_value and raw_camera_value != "auto":
-            requested_camera = int(raw_camera_value)
-            if requested_camera not in SUPPORTED_CAMERA_NUMBERS:
-                return jsonify({"error": "Camera number must be 1–9 or auto."}), 400
+        try:
+            requested_camera, settings = parse_detection_settings(request.form)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
         image_bytes = file.read()
         print(
@@ -975,11 +1928,25 @@ def detect():
             file.content_type,
             "Size:",
             len(image_bytes),
+            "Analysis mode:",
+            settings.analysis_mode,
             "Requested camera:",
             requested_camera or "auto",
+            "Detection size:",
+            settings.detection_size,
+            "Confidence:",
+            round(settings.confidence_threshold, 2),
+            "Empty sensitivity:",
+            round(settings.empty_sensitivity, 2),
+            "Infer edge slots:",
+            settings.infer_edge_slots,
         )
 
-        input_b64, output_b64, stats = process_image(image_bytes, requested_camera)
+        input_b64, output_b64, stats = process_image(
+            image_bytes,
+            requested_camera,
+            settings=settings,
+        )
         return jsonify(
             {
                 "success": True,

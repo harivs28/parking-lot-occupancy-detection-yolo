@@ -18,6 +18,16 @@ const resultsSection = document.getElementById('results-section');
 const loadingOverlay = document.getElementById('loading-overlay');
 const occupancyBarContainer = document.getElementById('occupancy-bar-container');
 const resultNotice = document.getElementById('result-notice');
+const analysisModeSelect = document.getElementById('analysis-mode');
+const cameraField = document.getElementById('camera-field');
+const cameraSelect = document.getElementById('camera-select');
+const detectionSizeSelect = document.getElementById('detection-size');
+const autoRunToggle = document.getElementById('auto-run-toggle');
+const confidenceThresholdInput = document.getElementById('confidence-threshold');
+const confidenceValue = document.getElementById('confidence-value');
+const emptySensitivityInput = document.getElementById('empty-sensitivity');
+const emptySensitivityValue = document.getElementById('empty-sensitivity-value');
+const inferEdgeSlotsInput = document.getElementById('infer-edge-slots');
 
 // ── State ───────────────────────────────────────────────────────────────────
 const IMAGE_EXTENSION_PATTERN = /\.(bmp|gif|heic|heif|jpe?g|png|tiff?|webp)$/i;
@@ -27,6 +37,7 @@ let currentRequestId = 0;
 
 // ── Initialize ──────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+    setupControls();
     setupUpload();
     setupClipboard();
     setupSmoothScroll();
@@ -112,8 +123,13 @@ async function handleFile(fileLike, source) {
     detectBtn.disabled = false;
 
     await showPreview(normalizedFile);
-    uploadStatus.textContent = `${normalizedFile.name} selected from ${source}. Starting automatic analysis...`;
-    await runDetection({ autoTriggered: true });
+    if (autoRunToggle.checked) {
+        uploadStatus.textContent = `${normalizedFile.name} selected from ${source}. Starting automatic analysis...`;
+        await runDetection({ autoTriggered: true });
+        return;
+    }
+
+    uploadStatus.textContent = `${normalizedFile.name} selected from ${source}. Adjust settings if needed, then click Analyze Again.`;
 }
 
 function normalizeImageFile(fileLike, source) {
@@ -189,6 +205,52 @@ function clearImage() {
     uploadStatus.textContent = 'No image selected yet.';
 }
 
+function setupControls() {
+    analysisModeSelect.addEventListener('change', syncControlState);
+    confidenceThresholdInput.addEventListener('input', syncControlState);
+    emptySensitivityInput.addEventListener('input', syncControlState);
+    syncControlState();
+}
+
+function syncControlState() {
+    const fixedModeSelected = analysisModeSelect.value === 'fixed';
+    cameraField.classList.toggle('hidden', !fixedModeSelected);
+    confidenceValue.textContent = Number(confidenceThresholdInput.value).toFixed(2);
+    emptySensitivityValue.textContent = describeEmptySensitivity(emptySensitivityInput.value);
+}
+
+function describeEmptySensitivity(rawValue) {
+    const value = Number(rawValue);
+    if (value <= 35) {
+        return 'Conservative';
+    }
+    if (value <= 65) {
+        return 'Balanced';
+    }
+    return 'Aggressive';
+}
+
+function collectSettings() {
+    return {
+        analysisMode: analysisModeSelect.value,
+        camera: analysisModeSelect.value === 'fixed' ? cameraSelect.value : 'auto',
+        detectionSize: detectionSizeSelect.value,
+        confidenceThreshold: Number(confidenceThresholdInput.value).toFixed(2),
+        emptySensitivity: emptySensitivityInput.value,
+        inferEdgeSlots: inferEdgeSlotsInput.checked
+    };
+}
+
+function summarizeSettings(settings) {
+    const modeLabelMap = {
+        auto: 'Auto',
+        fixed: `Fixed Camera ${settings.camera}`,
+        generic: 'Generic estimate'
+    };
+
+    return `${modeLabelMap[settings.analysisMode]} • ${detectionSizeSelect.selectedOptions[0].text}`;
+}
+
 function extractImageFromClipboard(clipboardData) {
     if (!clipboardData || !clipboardData.items) {
         return null;
@@ -241,14 +303,20 @@ async function runDetection({ autoTriggered }) {
     const requestId = ++currentRequestId;
     currentRequestController = new AbortController();
     setLoadingState(true);
+    const settings = collectSettings();
     uploadStatus.textContent = autoTriggered
-        ? `Analyzing ${selectedFile.name} automatically...`
-        : `Re-running analysis for ${selectedFile.name}...`;
+        ? `Analyzing ${selectedFile.name} automatically with ${summarizeSettings(settings)}...`
+        : `Re-running analysis for ${selectedFile.name} with ${summarizeSettings(settings)}...`;
 
     try {
         const formData = new FormData();
         formData.append('image', selectedFile, selectedFile.name);
-        formData.append('camera', 'auto');
+        formData.append('camera', settings.camera);
+        formData.append('analysis_mode', settings.analysisMode);
+        formData.append('detection_size', settings.detectionSize);
+        formData.append('confidence_threshold', settings.confidenceThreshold);
+        formData.append('empty_sensitivity', settings.emptySensitivity);
+        formData.append('infer_edge_slots', settings.inferEdgeSlots ? '1' : '0');
 
         const response = await fetch('/api/detect', {
             method: 'POST',
@@ -290,14 +358,23 @@ function setLoadingState(isLoading) {
 }
 
 function displayResults(data) {
-    const layoutSupported = Boolean(data.stats.layout_supported);
+    const slotMode = data.stats.slot_mode || (data.stats.layout_supported ? 'fixed' : 'vehicle_only');
+    const hasSlotEstimate = slotMode !== 'vehicle_only';
     resultsSection.classList.remove('hidden');
 
     setTimeout(() => {
         resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 100);
 
-    if (layoutSupported) {
+    if (slotMode === 'estimated') {
+        setStatLabels('Estimated Slots', 'Estimated Empty', 'Estimated Occupied', 'Estimated Rate');
+        animateCounter('stat-total', data.stats.total);
+        animateCounter('stat-empty', data.stats.empty);
+        animateCounter('stat-occupied', data.stats.occupied);
+        setStatValue('stat-rate', `${data.stats.occupancy_rate}%`);
+        occupancyBarContainer.classList.remove('hidden');
+        document.getElementById('occupancy-fill').style.width = `${data.stats.occupancy_rate}%`;
+    } else if (hasSlotEstimate) {
         setStatLabels('Total Slots', 'Empty Slots', 'Occupied Slots', 'Occupancy Rate');
         animateCounter('stat-total', data.stats.total);
         animateCounter('stat-empty', data.stats.empty);
@@ -318,9 +395,9 @@ function displayResults(data) {
     document.getElementById('result-original').src = data.input_image;
     document.getElementById('result-detected').src = data.output_image;
     document.getElementById('result-camera').textContent = `Profile: ${data.stats.camera_label}`;
-    document.getElementById('result-mode').textContent = layoutSupported
-        ? (data.stats.auto_profile ? 'Mode: Auto matched' : 'Mode: Manual')
-        : 'Mode: Vehicle only';
+    document.getElementById('result-mode').textContent = `Mode: ${data.stats.result_mode_label || 'Waiting'}`;
+    document.getElementById('result-detail').textContent = `Detail: ${data.stats.detection_profile_label || 'Auto'}`;
+    document.getElementById('result-sensitivity').textContent = `Empty fill: ${data.stats.empty_sensitivity_label || 'Balanced'}`;
     document.getElementById('result-detections').textContent = `Vehicles: ${data.stats.detections}`;
     document.getElementById('result-format').textContent = `Format: ${data.stats.input_format}`;
 

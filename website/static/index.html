@@ -90,7 +90,7 @@
         <div class="container">
             <div class="section-header">
                 <h2 class="section-title">Upload & Analyze</h2>
-                <p class="section-desc">Users only need to upload or paste an image. Detection starts automatically.</p>
+                <p class="section-desc">Auto mode stays one-click, but users can now tune detection size, confidence, and generic empty-slot sensitivity when needed.</p>
             </div>
 
             <div class="upload-grid">
@@ -157,33 +157,96 @@
                                 <path d="M12 3v3M18.364 5.636l-2.121 2.121M21 12h-3M18.364 18.364l-2.121-2.121M12 21v-3M5.636 18.364l2.121-2.121M3 12h3M5.636 5.636l2.121 2.121"/>
                                 <circle cx="12" cy="12" r="4"/>
                             </svg>
-                            Automatic Analysis
+                            Analysis Controls
                         </h3>
                     </div>
                     <div class="settings-body auto-body">
                         <div class="auto-highlight">
-                            <span class="auto-pill">No manual values required</span>
+                            <span class="auto-pill">Auto is still default</span>
                             <p class="auto-text">
-                                The app now uses automatic decoding, vehicle-only YOLO filtering,
-                                duplicate removal, and best-fit camera-profile matching.
+                                Upload or paste an image and let ParkVision AI decide automatically, or switch
+                                to manual controls when a parking-lot image needs more detail or a stricter
+                                generic empty-slot estimate.
                             </p>
                         </div>
+                        <div class="settings-grid">
+                            <label class="field">
+                                <span class="field-label">Analysis mode</span>
+                                <select class="field-control" id="analysis-mode">
+                                    <option value="auto" selected>Auto match</option>
+                                    <option value="generic">Generic estimate</option>
+                                    <option value="fixed">Fixed camera profile</option>
+                                </select>
+                                <span class="field-hint">Auto tries the built-in camera layouts first, then falls back to a generic estimate.</span>
+                            </label>
+                            <label class="field hidden" id="camera-field">
+                                <span class="field-label">Camera profile</span>
+                                <select class="field-control" id="camera-select">
+                                    <option value="1">Camera 1</option>
+                                    <option value="2">Camera 2</option>
+                                    <option value="3">Camera 3</option>
+                                    <option value="4">Camera 4</option>
+                                    <option value="5" selected>Camera 5</option>
+                                    <option value="6">Camera 6</option>
+                                    <option value="7">Camera 7</option>
+                                    <option value="8">Camera 8</option>
+                                    <option value="9">Camera 9</option>
+                                </select>
+                                <span class="field-hint">Use only when the image really belongs to one of the 9 built-in layouts.</span>
+                            </label>
+                            <label class="field">
+                                <span class="field-label">Detection size</span>
+                                <select class="field-control" id="detection-size">
+                                    <option value="auto" selected>Auto</option>
+                                    <option value="balanced">Balanced</option>
+                                    <option value="high">High detail</option>
+                                    <option value="max">Max detail</option>
+                                </select>
+                                <span class="field-hint">Higher detail keeps more image resolution for prediction, but it runs slower.</span>
+                            </label>
+                            <label class="toggle-field">
+                                <span class="field-label">Auto run after upload</span>
+                                <input type="checkbox" id="auto-run-toggle" checked>
+                                <span class="field-hint">When enabled, analysis starts immediately after upload or paste.</span>
+                            </label>
+                        </div>
+                        <div class="advanced-grid">
+                            <label class="range-field">
+                                <div class="field-row">
+                                    <span class="field-label">Vehicle confidence</span>
+                                    <span class="range-value" id="confidence-value">0.18</span>
+                                </div>
+                                <input type="range" id="confidence-threshold" min="0.10" max="0.32" step="0.01" value="0.18">
+                                <span class="field-hint">Lower values detect more vehicles. Higher values stay stricter.</span>
+                            </label>
+                            <label class="range-field">
+                                <div class="field-row">
+                                    <span class="field-label">Empty-slot sensitivity</span>
+                                    <span class="range-value" id="empty-sensitivity-value">Conservative</span>
+                                </div>
+                                <input type="range" id="empty-sensitivity" min="0" max="100" step="5" value="35">
+                                <span class="field-hint">Lower values reduce false empty-space boxes in generic mode.</span>
+                            </label>
+                        </div>
+                        <label class="checkbox-field">
+                            <input type="checkbox" id="infer-edge-slots">
+                            <div class="checkbox-copy">
+                                <span class="field-label">Infer row-end empty slots</span>
+                                <span class="field-hint">Off by default for cleaner generic estimates on arbitrary parking-lot images.</span>
+                            </div>
+                        </label>
                         <div class="feature-list">
+                            <div class="feature-item">
+                                <span class="feature-title">Adaptive image scaling</span>
+                                <span class="feature-copy">Low-resolution parking images are automatically upscaled before prediction to improve vehicle recall.</span>
+                            </div>
                             <div class="feature-item">
                                 <span class="feature-title">Smart upload flow</span>
                                 <span class="feature-copy">Browse, drag-and-drop, or paste with Ctrl+V or Cmd+V.</span>
                             </div>
                             <div class="feature-item">
-                                <span class="feature-title">Wide image support</span>
-                                <span class="feature-copy">Handles common parking-image formats and clipboard screenshots in one path.</span>
-                            </div>
-                            <div class="feature-item">
-                                <span class="feature-title">Automatic layout matching</span>
-                                <span class="feature-copy">Chooses the closest parking-slot profile so users do not need to select camera numbers.</span>
-                            </div>
-                            <div class="feature-item">
-                                <span class="feature-title">Improved YOLO output</span>
-                                <span class="feature-copy">Uses vehicle-class confidence scoring and non-max suppression for cleaner detections.</span>
+                                <span class="feature-title">Cleaner generic estimates</span>
+                                <span class="feature-copy">The default generic layout is now more conservative so broad empty pavement is less likely to turn into false slot boxes.</span>
                             </div>
                         </div>
                     </div>
@@ -196,7 +259,7 @@
         <div class="container">
             <div class="section-header">
                 <h2 class="section-title">Detection Results</h2>
-                <p class="section-desc">Annotated parking occupancy with the automatically selected profile.</p>
+                <p class="section-desc">Annotated parking occupancy using either a matched camera template or a generic estimated parking layout.</p>
             </div>
 
             <div class="stats-grid" id="stats-grid">
@@ -257,6 +320,8 @@
             <div class="result-meta">
                 <span class="result-pill" id="result-camera">Profile: Auto</span>
                 <span class="result-pill" id="result-mode">Mode: Waiting</span>
+                <span class="result-pill" id="result-detail">Detail: Auto</span>
+                <span class="result-pill" id="result-sensitivity">Empty fill: Conservative</span>
                 <span class="result-pill" id="result-detections">Vehicles: 0</span>
                 <span class="result-pill" id="result-format">Format: --</span>
             </div>
@@ -348,7 +413,7 @@
                         </svg>
                     </div>
                     <h3 class="step-title">Auto Layout Match</h3>
-                    <p class="step-desc">The app compares the scene to known parking layouts and overlays the best-fit slot map automatically.</p>
+                    <p class="step-desc">The app first tries the known parking layouts, then estimates parking rows and empty slots for general parking-lot images.</p>
                 </div>
             </div>
         </div>
