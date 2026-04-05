@@ -30,7 +30,7 @@
             <span class="nav-title">ParkVision <span class="accent">AI</span></span>
         </div>
         <div class="nav-links">
-            <a href="#upload-section" class="nav-link">Detect</a>
+            <a href="#analysis-tabs" class="nav-link">Analyze</a>
             <a href="#about-section" class="nav-link">How It Works</a>
         </div>
     </nav>
@@ -86,7 +86,23 @@
         </div>
     </header>
 
-    <section class="section" id="upload-section">
+    <section class="section section-tabs" id="analysis-tabs">
+        <div class="container">
+            <div class="mode-tabs" role="tablist" aria-label="Analysis mode tabs">
+                <button class="mode-tab active" id="tab-image" type="button" data-tab-target="image" aria-selected="true">
+                    Image Analysis
+                </button>
+                <button class="mode-tab" id="tab-live" type="button" data-tab-target="live" aria-selected="false">
+                    Live 5G Camera
+                </button>
+            </div>
+            <p class="mode-tabs-copy">
+                Image uploads stay unchanged, while the live tab manages RTSP or HTTP camera sessions on the backend and samples one frame every 20 seconds.
+            </p>
+        </div>
+    </section>
+
+    <section class="section" id="upload-section" data-tab-panel="image">
         <div class="container">
             <div class="section-header">
                 <h2 class="section-title">Upload & Analyze</h2>
@@ -255,7 +271,244 @@
         </div>
     </section>
 
-    <section class="section results-section hidden" id="results-section">
+    <section class="section hidden" id="live-section" data-tab-panel="live">
+        <div class="container">
+            <div class="section-header">
+                <h2 class="section-title">Live 5G Camera</h2>
+                <p class="section-desc">ParkVision AI keeps the stream on the backend, samples the latest decodable frame every 20 seconds, and returns the newest input and annotated result.</p>
+            </div>
+
+            <div class="upload-grid live-grid">
+                <div class="card auto-card">
+                    <div class="card-header">
+                        <h3 class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="22" height="22">
+                                <path d="M3 12h3m12 0h3M12 3v3m0 12v3"/>
+                                <rect x="5" y="5" width="14" height="14" rx="2"/>
+                            </svg>
+                            Live Stream Controls
+                        </h3>
+                    </div>
+                    <div class="settings-body auto-body">
+                        <label class="field field-span-full">
+                            <span class="field-label">Camera URL</span>
+                            <input class="field-control" id="live-camera-url" type="url" placeholder="rtsp://camera/live or http://camera/mjpeg">
+                            <span class="field-hint">Use a backend-reachable RTSP or HTTP stream. The server captures and analyzes one frame every 20 seconds in this phase.</span>
+                        </label>
+
+                        <div class="upload-actions live-actions">
+                            <button class="btn btn-primary btn-full" id="live-start-btn" type="button">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                                    <polygon points="5 3 19 12 5 21 5 3"/>
+                                </svg>
+                                <span id="live-start-btn-text">Start Live Analysis</span>
+                            </button>
+                            <button class="btn btn-secondary btn-full" id="live-stop-btn" type="button" disabled>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+                                    <rect x="6" y="6" width="12" height="12" rx="2"/>
+                                </svg>
+                                Stop
+                            </button>
+                        </div>
+
+                        <div class="settings-grid">
+                            <label class="field">
+                                <span class="field-label">Analysis mode</span>
+                                <select class="field-control" id="live-analysis-mode">
+                                    <option value="auto" selected>Auto match</option>
+                                    <option value="generic">Generic estimate</option>
+                                    <option value="fixed">Fixed camera profile</option>
+                                </select>
+                                <span class="field-hint">Auto starts unlocked, then locks to one strong built-in camera match after repeated stable captures.</span>
+                            </label>
+                            <label class="field hidden" id="live-camera-field">
+                                <span class="field-label">Camera profile</span>
+                                <select class="field-control" id="live-camera-select">
+                                    <option value="1">Camera 1</option>
+                                    <option value="2">Camera 2</option>
+                                    <option value="3">Camera 3</option>
+                                    <option value="4">Camera 4</option>
+                                    <option value="5" selected>Camera 5</option>
+                                    <option value="6">Camera 6</option>
+                                    <option value="7">Camera 7</option>
+                                    <option value="8">Camera 8</option>
+                                    <option value="9">Camera 9</option>
+                                </select>
+                                <span class="field-hint">Only use fixed mode when the live stream is known to match one of the 9 built-in layouts.</span>
+                            </label>
+                            <label class="field">
+                                <span class="field-label">Detection size</span>
+                                <select class="field-control" id="live-detection-size">
+                                    <option value="auto" selected>Auto</option>
+                                    <option value="balanced">Balanced</option>
+                                    <option value="high">High detail</option>
+                                    <option value="max">Max detail</option>
+                                </select>
+                                <span class="field-hint">Higher detail can improve small-vehicle recall, but it increases capture processing time.</span>
+                            </label>
+                            <div class="field read-only-field">
+                                <span class="field-label">Capture interval</span>
+                                <span class="read-only-value" id="live-capture-interval">20 seconds</span>
+                                <span class="field-hint">This phase uses a fixed backend sampling interval.</span>
+                            </div>
+                        </div>
+
+                        <div class="advanced-grid">
+                            <label class="range-field">
+                                <div class="field-row">
+                                    <span class="field-label">Vehicle confidence</span>
+                                    <span class="range-value" id="live-confidence-value">0.18</span>
+                                </div>
+                                <input type="range" id="live-confidence-threshold" min="0.10" max="0.32" step="0.01" value="0.18">
+                                <span class="field-hint">Lower values detect more vehicles. Higher values stay stricter.</span>
+                            </label>
+                            <label class="range-field">
+                                <div class="field-row">
+                                    <span class="field-label">Empty-slot sensitivity</span>
+                                    <span class="range-value" id="live-empty-sensitivity-value">Conservative</span>
+                                </div>
+                                <input type="range" id="live-empty-sensitivity" min="0" max="100" step="5" value="35">
+                                <span class="field-hint">Lower values keep generic fallback estimates more conservative.</span>
+                            </label>
+                        </div>
+
+                        <label class="checkbox-field">
+                            <input type="checkbox" id="live-infer-edge-slots">
+                            <div class="checkbox-copy">
+                                <span class="field-label">Infer row-end empty slots</span>
+                                <span class="field-hint">Use this only when the generic fallback is missing obvious empty spaces at the ends of parking rows.</span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="card auto-card">
+                    <div class="card-header">
+                        <h3 class="card-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="22" height="22">
+                                <path d="M3 12h18"/>
+                                <path d="M3 6h18"/>
+                                <path d="M3 18h18"/>
+                            </svg>
+                            Session Status
+                        </h3>
+                    </div>
+                    <div class="settings-body auto-body">
+                        <div class="result-meta live-result-meta">
+                            <span class="result-pill live-status-pill" id="live-connection-status">Status: Idle</span>
+                            <span class="result-pill" id="live-camera-lock">Camera lock: Auto-detect</span>
+                        </div>
+
+                        <div class="feature-list live-status-list">
+                            <div class="feature-item">
+                                <span class="feature-title">Session started</span>
+                                <span class="feature-copy" id="live-started-at">Not started</span>
+                            </div>
+                            <div class="feature-item">
+                                <span class="feature-title">Last capture</span>
+                                <span class="feature-copy" id="live-last-capture">Waiting for first frame</span>
+                            </div>
+                            <div class="feature-item">
+                                <span class="feature-title">Next capture</span>
+                                <span class="feature-copy" id="live-next-capture">Starts after the first successful frame read</span>
+                            </div>
+                        </div>
+
+                        <p class="upload-status" id="live-session-status">No live stream session running.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="result-notice hidden" id="live-result-notice"></div>
+
+            <div class="stats-grid" id="live-stats-grid">
+                <div class="stat-card stat-total">
+                    <div class="stat-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28">
+                            <rect x="3" y="3" width="7" height="7" rx="1"/>
+                            <rect x="14" y="3" width="7" height="7" rx="1"/>
+                            <rect x="3" y="14" width="7" height="7" rx="1"/>
+                            <rect x="14" y="14" width="7" height="7" rx="1"/>
+                        </svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-number" id="live-stat-total">0</span>
+                        <span class="stat-label">Total</span>
+                    </div>
+                </div>
+                <div class="stat-card stat-empty">
+                    <div class="stat-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                            <polyline points="22 4 12 14.01 9 11.01"/>
+                        </svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-number" id="live-stat-empty">0</span>
+                        <span class="stat-label">Empty</span>
+                    </div>
+                </div>
+                <div class="stat-card stat-occupied">
+                    <div class="stat-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="15" y1="9" x2="9" y2="15"/>
+                            <line x1="9" y1="9" x2="15" y2="15"/>
+                        </svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-number" id="live-stat-occupied">0</span>
+                        <span class="stat-label">Occupied</span>
+                    </div>
+                </div>
+                <div class="stat-card stat-rate">
+                    <div class="stat-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="28" height="28">
+                            <line x1="18" y1="20" x2="18" y2="10"/>
+                            <line x1="12" y1="20" x2="12" y2="4"/>
+                            <line x1="6" y1="20" x2="6" y2="14"/>
+                        </svg>
+                    </div>
+                    <div class="stat-info">
+                        <span class="stat-number" id="live-stat-rate">0%</span>
+                        <span class="stat-label">Occupancy Rate</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="result-meta">
+                <span class="result-pill" id="live-result-camera">Profile: Waiting</span>
+                <span class="result-pill" id="live-result-mode">Mode: Waiting</span>
+                <span class="result-pill" id="live-result-detail">Detail: Auto</span>
+                <span class="result-pill" id="live-result-sensitivity">Empty fill: Conservative</span>
+                <span class="result-pill" id="live-result-detections">Vehicles: 0</span>
+                <span class="result-pill" id="live-result-format">Source: Stream</span>
+            </div>
+
+            <div class="comparison-grid">
+                <div class="comparison-card">
+                    <div class="comparison-header">
+                        <span class="comparison-badge badge-original">Latest Input</span>
+                    </div>
+                    <div class="comparison-image-wrap">
+                        <div class="comparison-placeholder" id="live-original-placeholder">Waiting for the first captured frame.</div>
+                        <img id="live-result-original" class="comparison-image hidden" alt="Latest live input frame">
+                    </div>
+                </div>
+                <div class="comparison-card">
+                    <div class="comparison-header">
+                        <span class="comparison-badge badge-detected">Latest Annotated</span>
+                    </div>
+                    <div class="comparison-image-wrap">
+                        <div class="comparison-placeholder" id="live-detected-placeholder">The annotated live result will appear here after analysis.</div>
+                        <img id="live-result-detected" class="comparison-image hidden" alt="Latest live annotated frame">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="section results-section hidden" id="results-section" data-tab-panel="image">
         <div class="container">
             <div class="section-header">
                 <h2 class="section-title">Detection Results</h2>

@@ -6,8 +6,14 @@ Ported from parking_yolo.cpp by Daniele Ninni
 import base64
 import csv
 import os
+import threading
+import time
 import traceback
-from dataclasses import dataclass
+import uuid
+from collections import deque
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import cv2
@@ -84,6 +90,12 @@ LAYOUT_MIN_FEATURE_RATIO = 3.0
 ROTATION_TRIGGER_DETECTION_COUNT = 8
 UPSCALE_TRIGGER_IMAGE_SIDE = 1100
 UPSCALE_TRIGGER_DETECTION_COUNT = 20
+REALTIME_CAPTURE_INTERVAL_SECONDS = 20
+LIVE_CAMERA_LOCK_MATCH_COUNT = 3
+LIVE_RESULT_HISTORY_SIZE = 3
+LIVE_STREAM_RETRY_DELAY_SECONDS = 2.0
+LIVE_STREAM_READ_SLEEP_SECONDS = 0.2
+LIVE_STREAM_REOPEN_AFTER_FAILURES = 6
 
 DETECTION_SIZE_PRESETS = {
     "balanced": {
@@ -150,6 +162,118 @@ class DetectionSettings:
     infer_edge_slots: bool = DEFAULT_INFER_EDGE_SLOTS
 
 
+@dataclass
+class FrameProcessingResult:
+    """Shared processed-frame payload used by uploads and live sessions."""
+
+    input_image: np.ndarray
+    output_image: np.ndarray
+    parking_lots: list
+    detections: list[dict]
+    stats: dict
+    selected_camera: int | None
+
+
+@dataclass
+class LiveStreamSession:
+    """Mutable state for one backend-managed realtime stream session."""
+
+    session_id: str
+    camera_url: str
+    settings: DetectionSettings
+    requested_camera: int | None = None
+    capture_interval_seconds: int = REALTIME_CAPTURE_INTERVAL_SECONDS
+    stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    history: deque = field(
+        default_factory=lambda: deque(maxlen=LIVE_RESULT_HISTORY_SIZE),
+        repr=False,
+    )
+    thread: threading.Thread | None = None
+    status: str = "starting"
+    started_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    last_frame_at: datetime | None = None
+    last_capture_at: datetime | None = None
+    next_capture_at: datetime | None = None
+    latest_result: dict | None = None
+    error: str | None = None
+    camera_locked: bool = False
+    locked_camera: int | None = None
+    last_candidate_camera: int | None = None
+    consecutive_camera_matches: int = 0
+
+    def snapshot(self) -> dict:
+        """Return a thread-safe JSON-serializable view of this session."""
+        with self.state_lock:
+            latest_result = deepcopy(self.latest_result) if self.latest_result is not None else None
+            return {
+                "session_id": self.session_id,
+                "status": self.status,
+                "started_at": format_timestamp(self.started_at),
+                "last_capture_at": format_timestamp(self.last_capture_at),
+                "next_capture_at": format_timestamp(self.next_capture_at),
+                "camera_locked": self.camera_locked,
+                "locked_camera": self.locked_camera,
+                "error": self.error,
+                "input_image": None if latest_result is None else latest_result["input_image"],
+                "output_image": None if latest_result is None else latest_result["output_image"],
+                "stats": (
+                    build_pending_live_stats(camera_locked=self.camera_locked)
+                    if latest_result is None
+                    else latest_result["stats"]
+                ),
+            }
+
+
+class LiveStreamSessionManager:
+    """Store, start, and stop live stream sessions by UUID."""
+
+    def __init__(self):
+        self._sessions: dict[str, LiveStreamSession] = {}
+        self._lock = threading.Lock()
+
+    def create(
+        self,
+        camera_url: str,
+        settings: DetectionSettings,
+        requested_camera: int | None = None,
+    ) -> LiveStreamSession:
+        session_id = str(uuid.uuid4())
+        session = LiveStreamSession(
+            session_id=session_id,
+            camera_url=camera_url,
+            settings=settings,
+            requested_camera=requested_camera,
+            next_capture_at=datetime.now(timezone.utc),
+        )
+        worker = threading.Thread(
+            target=run_live_stream_session,
+            args=(session,),
+            name=f"live-stream-{session_id}",
+            daemon=True,
+        )
+        session.thread = worker
+        with self._lock:
+            self._sessions[session_id] = session
+        worker.start()
+        return session
+
+    def get(self, session_id: str) -> LiveStreamSession | None:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def delete(self, session_id: str) -> LiveStreamSession | None:
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
+        if session is None:
+            return None
+
+        stop_live_stream_session(session)
+        return session
+
+
 # ── Load YOLO Model (once at startup) ───────────────────────────────────────
 print(f"[INFO] Loading YOLOv5 model from: {YOLO_MODEL_PATH}")
 ort_session = ort.InferenceSession(
@@ -157,6 +281,7 @@ ort_session = ort.InferenceSession(
     providers=["CPUExecutionProvider"],
 )
 input_name = ort_session.get_inputs()[0].name
+INFERENCE_LOCK = threading.Lock()
 print("[INFO] YOLOv5 model loaded successfully!")
 
 
@@ -205,29 +330,39 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
 
 
-def parse_bool(value: str | None, default: bool = False) -> bool:
+def parse_bool(value, default: bool = False) -> bool:
     """Parse a checkbox-like form value."""
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def parse_float_value(
-    raw_value: str | None,
+    raw_value,
     *,
     default: float,
     min_value: float,
     max_value: float,
 ) -> float:
     """Parse and clamp a float form value."""
-    if raw_value is None or raw_value.strip() == "":
+    if raw_value is None:
         return default
-    return clamp(float(raw_value), min_value, max_value)
+    if isinstance(raw_value, str):
+        if raw_value.strip() == "":
+            return default
+        parsed_value = float(raw_value)
+    else:
+        parsed_value = float(raw_value)
+    return clamp(parsed_value, min_value, max_value)
 
 
 def parse_analysis_mode(raw_value: str | None) -> str:
     """Normalize the requested analysis mode."""
-    normalized_value = (raw_value or DEFAULT_ANALYSIS_MODE).strip().lower()
+    normalized_value = str(raw_value or DEFAULT_ANALYSIS_MODE).strip().lower()
     if normalized_value not in {"auto", "fixed", "generic"}:
         raise ValueError("Analysis mode must be auto, fixed, or generic.")
     return normalized_value
@@ -235,7 +370,7 @@ def parse_analysis_mode(raw_value: str | None) -> str:
 
 def parse_detection_size(raw_value: str | None) -> str:
     """Normalize the requested detection detail preset."""
-    normalized_value = (raw_value or DEFAULT_DETECTION_SIZE).strip().lower()
+    normalized_value = str(raw_value or DEFAULT_DETECTION_SIZE).strip().lower()
     if normalized_value not in {"auto", *DETECTION_SIZE_PRESETS.keys()}:
         raise ValueError("Detection size must be auto, balanced, high, or max.")
     return normalized_value
@@ -278,6 +413,18 @@ def describe_empty_sensitivity(empty_sensitivity: float) -> str:
     return "Aggressive"
 
 
+def utcnow() -> datetime:
+    """Return the current UTC timestamp with timezone information."""
+    return datetime.now(timezone.utc)
+
+
+def format_timestamp(value: datetime | None) -> str | None:
+    """Return an ISO-8601 string for API responses."""
+    if value is None:
+        return None
+    return value.isoformat(timespec="seconds")
+
+
 def parse_detection_settings(form_data) -> tuple[int | None, DetectionSettings]:
     """Parse analysis controls from the request form."""
     analysis_mode = parse_analysis_mode(form_data.get("analysis_mode"))
@@ -300,7 +447,7 @@ def parse_detection_settings(form_data) -> tuple[int | None, DetectionSettings]:
     )
 
     requested_camera = None
-    raw_camera_value = (form_data.get("camera", "auto") or "auto").strip().lower()
+    raw_camera_value = str(form_data.get("camera", "auto") or "auto").strip().lower()
     if analysis_mode == "fixed":
         if raw_camera_value and raw_camera_value != "auto":
             requested_camera = int(raw_camera_value)
@@ -1770,16 +1917,62 @@ def encode_image_to_base64(image: np.ndarray) -> str:
     return base64.b64encode(buffer).decode("utf-8")
 
 
-def process_image(
-    image_bytes: bytes,
+def build_pending_live_stats(
+    *,
+    camera_locked: bool = False,
+    warning_message: str = "",
+) -> dict:
+    """Return the placeholder stats payload for a live session."""
+    return {
+        "camera_label": "Waiting for live capture",
+        "slot_mode": "pending",
+        "total": 0,
+        "empty": 0,
+        "occupied": 0,
+        "occupancy_rate": 0.0,
+        "detections": 0,
+        "warning_message": warning_message,
+        "camera_locked": camera_locked,
+    }
+
+
+def build_result_subtitle(stats: dict, detections: list[dict]) -> str:
+    """Return the small header subtitle for the annotated image."""
+    if stats["slot_mode"] in {"fixed", "manual", "estimated"}:
+        return f"Vehicles detected: {len(detections)}"
+    return "Layout could not be estimated: showing vehicle detections only"
+
+
+def render_annotated_result(
+    display_image: np.ndarray,
+    parking_lots: list,
+    stats: dict,
+    display_detections: list[dict],
+) -> np.ndarray:
+    """Render the final annotated frame for uploads and live captures."""
+    annotated_image = display_image.copy()
+    if stats["slot_mode"] in {"fixed", "manual", "estimated"}:
+        annotated_image = draw_parking_lots(annotated_image, parking_lots, stats["slots"])
+    annotated_image = draw_vehicle_detections(annotated_image, display_detections)
+    return draw_result_header(
+        annotated_image,
+        stats["camera_label"],
+        build_result_subtitle(stats, display_detections),
+    )
+
+
+def process_frame(
+    image: np.ndarray,
     requested_camera: int | None = None,
     settings: DetectionSettings | None = None,
-) -> tuple[str, str, dict]:
-    """Full detection pipeline: image bytes → annotated image + stats."""
+    *,
+    input_format: str = "STREAM",
+    allow_requested_camera_fallback: bool = False,
+) -> FrameProcessingResult:
+    """Shared detection pipeline for decoded uploads and live video frames."""
     if settings is None:
         settings = DetectionSettings()
 
-    image, input_format = decode_image(image_bytes)
     detection_profile = resolve_detection_profile(settings.detection_size, image.shape)
     detection_image = resize_for_detection(
         image,
@@ -1787,19 +1980,24 @@ def process_image(
     )
     display_image = resize_to_display(image)
 
-    detections = run_vehicle_detection(
-        detection_image,
-        confidence_threshold=settings.confidence_threshold,
-        detection_profile=detection_profile,
-    )
+    with INFERENCE_LOCK:
+        detections = run_vehicle_detection(
+            detection_image,
+            confidence_threshold=settings.confidence_threshold,
+            detection_profile=detection_profile,
+        )
+
     display_detections = scale_detections_to_display(
         detections,
         source_shape=detection_image.shape,
         target_shape=display_image.shape,
     )
 
+    selected_camera = None
+    parking_lots = []
+    strong_camera_candidate = None
+
     if settings.analysis_mode == "generic":
-        selected_camera = None
         parking_lots, stats = infer_generic_parking_layout(
             display_detections,
             display_image.shape,
@@ -1814,31 +2012,47 @@ def process_image(
             detection_area_threshold=DEFAULT_DETECTION_AREA_THRESHOLD,
         )
 
-        if settings.analysis_mode == "auto" and stats["slot_mode"] == "vehicle_only":
+        if settings.analysis_mode == "auto" and requested_camera is None:
+            strong_camera_candidate = (
+                selected_camera if stats["slot_mode"] in {"fixed", "manual"} else None
+            )
+
+        if (
+            requested_camera is not None
+            and allow_requested_camera_fallback
+            and display_detections
+            and stats["matched_detections"] == 0
+        ):
             parking_lots, generic_stats = infer_generic_parking_layout(
                 display_detections,
                 display_image.shape,
                 settings=settings,
             )
+            locked_camera_warning = (
+                f"Locked Camera {requested_camera} did not align cleanly with this frame. "
+            )
             if generic_stats["slot_mode"] != "vehicle_only":
+                generic_stats["warning_message"] = (
+                    locked_camera_warning + generic_stats["warning_message"]
+                )
                 stats = generic_stats
+                selected_camera = None
             else:
-                stats["warning_message"] = generic_stats["warning_message"]
+                stats["warning_message"] = locked_camera_warning + generic_stats["warning_message"]
+        elif settings.analysis_mode == "auto" and requested_camera is None:
+            if stats["slot_mode"] == "vehicle_only":
+                parking_lots, generic_stats = infer_generic_parking_layout(
+                    display_detections,
+                    display_image.shape,
+                    settings=settings,
+                )
+                if generic_stats["slot_mode"] != "vehicle_only":
+                    stats = generic_stats
+                    selected_camera = None
+                else:
+                    stats["warning_message"] = generic_stats["warning_message"]
 
-    annotated_image = display_image.copy()
-    if stats["slot_mode"] in {"fixed", "manual", "estimated"}:
-        annotated_image = draw_parking_lots(annotated_image, parking_lots, stats["slots"])
-    annotated_image = draw_vehicle_detections(annotated_image, display_detections)
-    annotated_image = draw_result_header(
-        annotated_image,
-        stats["camera_label"],
-        (
-            f"Vehicles detected: {len(display_detections)}"
-            if stats["slot_mode"] in {"fixed", "manual", "estimated"}
-            else "Layout could not be estimated: showing vehicle detections only"
-        ),
-    )
-
+    stats = deepcopy(stats)
     stats.update(
         {
             "detections": len(display_detections),
@@ -1864,6 +2078,7 @@ def process_image(
                 settings.empty_sensitivity
             ),
             "infer_edge_slots": settings.infer_edge_slots,
+            "camera_lock_candidate": strong_camera_candidate,
         }
     )
 
@@ -1877,10 +2092,319 @@ def process_image(
         else:
             stats["warning_message"] = no_detection_message
 
-    return (
-        encode_image_to_base64(display_image),
-        encode_image_to_base64(annotated_image),
+    annotated_image = render_annotated_result(
+        display_image,
+        parking_lots,
         stats,
+        display_detections,
+    )
+    return FrameProcessingResult(
+        input_image=display_image,
+        output_image=annotated_image,
+        parking_lots=parking_lots,
+        detections=display_detections,
+        stats=stats,
+        selected_camera=selected_camera,
+    )
+
+
+def normalize_slot_mode_for_smoothing(slot_mode: str) -> str:
+    """Treat auto-fixed and manually fixed layouts as the same smoothing mode."""
+    if slot_mode in {"fixed", "manual"}:
+        return "fixed"
+    return slot_mode
+
+
+def can_majority_vote_slots(results: list[FrameProcessingResult]) -> bool:
+    """Return True when the recent results share identical slot identities."""
+    if len(results) < 2:
+        return False
+
+    latest_result = results[-1]
+    latest_slot_mode = normalize_slot_mode_for_smoothing(
+        latest_result.stats.get("slot_mode", "")
+    )
+    latest_slots = latest_result.stats.get("slots", [])
+    latest_slot_ids = [slot["slot_id"] for slot in latest_slots]
+    if latest_slot_mode not in {"fixed", "estimated"} or not latest_slot_ids:
+        return False
+
+    for result in results:
+        if (
+            normalize_slot_mode_for_smoothing(result.stats.get("slot_mode", ""))
+            != latest_slot_mode
+        ):
+            return False
+        if result.selected_camera != latest_result.selected_camera:
+            return False
+        if [slot["slot_id"] for slot in result.stats.get("slots", [])] != latest_slot_ids:
+            return False
+
+    return True
+
+
+def smooth_live_result(
+    session: LiveStreamSession,
+    result: FrameProcessingResult,
+) -> FrameProcessingResult:
+    """Apply short-history slot voting so live counts do not oscillate as much."""
+    history = list(session.history) + [result]
+    if not can_majority_vote_slots(history):
+        return result
+
+    latest_result = history[-1]
+    smoothed_stats = deepcopy(latest_result.stats)
+    smoothed_slots = []
+
+    for slot_index, latest_slot in enumerate(latest_result.stats["slots"]):
+        occupied_votes = sum(
+            1 for item in history if item.stats["slots"][slot_index]["occupied"]
+        )
+        overlap_samples = [
+            float(item.stats["slots"][slot_index].get("overlap_ratio", 0.0))
+            for item in history
+        ]
+        slot_detail = deepcopy(latest_slot)
+        slot_detail["occupied"] = occupied_votes >= ((len(history) // 2) + 1)
+        slot_detail["overlap_ratio"] = round(sum(overlap_samples) / len(overlap_samples), 3)
+        smoothed_slots.append(slot_detail)
+
+    occupied_count = sum(1 for slot in smoothed_slots if slot["occupied"])
+    total_count = len(smoothed_slots)
+    smoothed_stats["slots"] = smoothed_slots
+    smoothed_stats["occupied"] = occupied_count
+    smoothed_stats["empty"] = total_count - occupied_count
+    smoothed_stats["total"] = total_count
+    smoothed_stats["occupancy_rate"] = round(
+        occupied_count / max(1, total_count) * 100.0,
+        1,
+    )
+    smoothed_output_image = render_annotated_result(
+        latest_result.input_image,
+        latest_result.parking_lots,
+        smoothed_stats,
+        latest_result.detections,
+    )
+    return FrameProcessingResult(
+        input_image=latest_result.input_image,
+        output_image=smoothed_output_image,
+        parking_lots=latest_result.parking_lots,
+        detections=latest_result.detections,
+        stats=smoothed_stats,
+        selected_camera=latest_result.selected_camera,
+    )
+
+
+def build_live_response_payload(
+    result: FrameProcessingResult,
+    *,
+    camera_locked: bool,
+) -> dict:
+    """Encode a processed live frame for JSON transport."""
+    stats = deepcopy(result.stats)
+    stats["camera_locked"] = camera_locked
+    if camera_locked and stats["slot_mode"] == "manual":
+        stats["result_mode_label"] = "Live locked profile"
+
+    return {
+        "input_image": f"data:image/jpeg;base64,{encode_image_to_base64(result.input_image)}",
+        "output_image": f"data:image/jpeg;base64,{encode_image_to_base64(result.output_image)}",
+        "stats": stats,
+    }
+
+
+def update_live_camera_lock(
+    session: LiveStreamSession,
+    result: FrameProcessingResult,
+) -> None:
+    """Lock a live session to one camera after three strong auto matches."""
+    if session.settings.analysis_mode != "auto" or session.requested_camera is not None:
+        return
+
+    candidate_camera = result.stats.get("camera_lock_candidate")
+    with session.state_lock:
+        if session.camera_locked:
+            return
+
+        if candidate_camera is None:
+            session.last_candidate_camera = None
+            session.consecutive_camera_matches = 0
+            return
+
+        if session.last_candidate_camera == candidate_camera:
+            session.consecutive_camera_matches += 1
+        else:
+            session.last_candidate_camera = candidate_camera
+            session.consecutive_camera_matches = 1
+
+        if session.consecutive_camera_matches >= LIVE_CAMERA_LOCK_MATCH_COUNT:
+            session.camera_locked = True
+            session.locked_camera = candidate_camera
+
+
+def open_video_stream(camera_url: str) -> cv2.VideoCapture | None:
+    """Open an RTSP or HTTP stream with a light preference for FFmpeg."""
+    capture = None
+    try:
+        if hasattr(cv2, "CAP_FFMPEG"):
+            capture = cv2.VideoCapture(camera_url, cv2.CAP_FFMPEG)
+        if capture is None or not capture.isOpened():
+            if capture is not None:
+                capture.release()
+            capture = cv2.VideoCapture(camera_url)
+        if capture is not None and capture.isOpened():
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return capture
+    except Exception:
+        if capture is not None:
+            capture.release()
+        raise
+
+    if capture is not None:
+        capture.release()
+    return None
+
+
+def stop_live_stream_session(session: LiveStreamSession) -> None:
+    """Signal the live worker to stop and wait briefly for cleanup."""
+    session.stop_event.set()
+    worker = session.thread
+    if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+        worker.join(timeout=5.0)
+    with session.state_lock:
+        session.status = "stopped"
+        session.next_capture_at = None
+
+
+def run_live_stream_session(session: LiveStreamSession) -> None:
+    """Read a live stream and analyze the most recent frame every 20 seconds."""
+    capture = None
+    consecutive_failures = 0
+
+    with session.state_lock:
+        session.status = "connecting"
+        session.next_capture_at = session.started_at
+
+    try:
+        while not session.stop_event.is_set():
+            if capture is None or not capture.isOpened():
+                capture = open_video_stream(session.camera_url)
+                if capture is None or not capture.isOpened():
+                    with session.state_lock:
+                        session.status = "reconnecting"
+                        session.error = (
+                            "Unable to open the live camera stream. Retrying shortly."
+                        )
+                    time.sleep(LIVE_STREAM_RETRY_DELAY_SECONDS)
+                    continue
+
+                with session.state_lock:
+                    session.status = "waiting_for_frame"
+                    session.error = None
+                consecutive_failures = 0
+
+            success, frame = capture.read()
+            current_time = utcnow()
+
+            if success and frame is not None and frame.size > 0:
+                consecutive_failures = 0
+                with session.state_lock:
+                    session.last_frame_at = current_time
+                    capture_due = (
+                        session.next_capture_at is None
+                        or current_time >= session.next_capture_at
+                    )
+                    if session.last_capture_at is None:
+                        session.status = "waiting_for_frame"
+                    elif session.status != "processing":
+                        session.status = "running"
+
+                if not capture_due:
+                    time.sleep(LIVE_STREAM_READ_SLEEP_SECONDS)
+                    continue
+
+                with session.state_lock:
+                    session.status = "processing"
+
+                effective_requested_camera = (
+                    session.locked_camera if session.camera_locked else session.requested_camera
+                )
+                processed_result = process_frame(
+                    frame,
+                    requested_camera=effective_requested_camera,
+                    settings=session.settings,
+                    input_format="STREAM",
+                    allow_requested_camera_fallback=session.camera_locked,
+                )
+                update_live_camera_lock(session, processed_result)
+                smoothed_result = smooth_live_result(session, processed_result)
+                live_payload = build_live_response_payload(
+                    smoothed_result,
+                    camera_locked=session.camera_locked,
+                )
+
+                with session.state_lock:
+                    session.history.append(smoothed_result)
+                    session.latest_result = live_payload
+                    session.last_capture_at = current_time
+                    session.next_capture_at = current_time + timedelta(
+                        seconds=session.capture_interval_seconds
+                    )
+                    session.error = None
+                    session.status = "running"
+                continue
+
+            consecutive_failures += 1
+            with session.state_lock:
+                session.status = "reconnecting"
+                session.error = (
+                    "The live stream dropped or stopped producing frames. Reconnecting."
+                )
+
+            if consecutive_failures >= LIVE_STREAM_REOPEN_AFTER_FAILURES:
+                if capture is not None:
+                    capture.release()
+                capture = None
+                consecutive_failures = 0
+                time.sleep(LIVE_STREAM_RETRY_DELAY_SECONDS)
+            else:
+                time.sleep(LIVE_STREAM_READ_SLEEP_SECONDS)
+    except Exception as exc:  # pragma: no cover - worker failure path
+        traceback.print_exc()
+        with session.state_lock:
+            session.status = "error"
+            session.error = f"Live analysis failed: {str(exc)}"
+            session.next_capture_at = None
+    finally:
+        if capture is not None:
+            capture.release()
+        with session.state_lock:
+            if session.stop_event.is_set():
+                session.status = "stopped"
+                session.next_capture_at = None
+
+
+def process_image(
+    image_bytes: bytes,
+    requested_camera: int | None = None,
+    settings: DetectionSettings | None = None,
+) -> tuple[str, str, dict]:
+    """Backwards-compatible bytes wrapper around the shared frame pipeline."""
+    if settings is None:
+        settings = DetectionSettings()
+
+    image, input_format = decode_image(image_bytes)
+    processed_result = process_frame(
+        image,
+        requested_camera=requested_camera,
+        settings=settings,
+        input_format=input_format,
+    )
+    return (
+        encode_image_to_base64(processed_result.input_image),
+        encode_image_to_base64(processed_result.output_image),
+        processed_result.stats,
     )
 
 
@@ -1889,6 +2413,7 @@ PARKING_LOTS = {
     for camera_number in SUPPORTED_CAMERA_NUMBERS
 }
 CAMERA_REFERENCES = load_camera_references()
+LIVE_SESSION_MANAGER = LiveStreamSessionManager()
 print(
     "[INFO] Loaded camera references:",
     sum(len(reference_group) for reference_group in CAMERA_REFERENCES.values()),
@@ -1961,6 +2486,55 @@ def detect():
     except Exception as exc:  # pragma: no cover - Flask error path
         traceback.print_exc()
         return jsonify({"error": f"Processing failed: {str(exc)}"}), 500
+
+
+@app.route("/api/realtime/session", methods=["POST"])
+def create_realtime_session():
+    """Start a backend-managed live stream session."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        camera_url = str(payload.get("camera_url", "") or "").strip()
+        if not camera_url:
+            return jsonify({"error": "camera_url is required."}), 400
+
+        try:
+            requested_camera, settings = parse_detection_settings(payload)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        session = LIVE_SESSION_MANAGER.create(
+            camera_url=camera_url,
+            settings=settings,
+            requested_camera=requested_camera,
+        )
+        return jsonify(
+            {
+                "session_id": session.session_id,
+                "status": session.status,
+                "capture_interval_seconds": session.capture_interval_seconds,
+            }
+        ), 201
+    except Exception as exc:  # pragma: no cover - Flask error path
+        traceback.print_exc()
+        return jsonify({"error": f"Could not start live session: {str(exc)}"}), 500
+
+
+@app.route("/api/realtime/session/<session_id>", methods=["GET"])
+def get_realtime_session(session_id: str):
+    """Return the latest live stream session state."""
+    session = LIVE_SESSION_MANAGER.get(session_id)
+    if session is None:
+        return jsonify({"error": "Live session not found."}), 404
+    return jsonify(session.snapshot())
+
+
+@app.route("/api/realtime/session/<session_id>", methods=["DELETE"])
+def delete_realtime_session(session_id: str):
+    """Stop and remove a live stream session."""
+    session = LIVE_SESSION_MANAGER.delete(session_id)
+    if session is None:
+        return jsonify({"error": "Live session not found."}), 404
+    return jsonify({"success": True, "status": "stopped"})
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

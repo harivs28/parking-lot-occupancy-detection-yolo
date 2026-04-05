@@ -1,0 +1,87 @@
+{
+  "analysis_mode": "auto",
+  "notes": "Expected counts for the bundled CNRPark sample images when processed by the shared ParkVision AI frame pipeline.",
+  "samples": [
+    {
+      "image": "OVERCAST/2015-11-16/camera1/2015-11-16_0910.jpg",
+      "expected_camera": 1,
+      "expected_camera_label": "Camera 1",
+      "expected_slot_mode": "fixed",
+      "expected_total": 35,
+      "expected_empty": 14,
+      "expected_occupied": 21
+    },
+    {
+      "image": "OVERCAST/2015-11-29/camera2/2015-11-29_1614.jpg",
+      "expected_camera": 2,
+      "expected_camera_label": "Camera 2",
+      "expected_slot_mode": "fixed",
+      "expected_total": 9,
+      "expected_empty": 6,
+      "expected_occupied": 3
+    },
+    {
+      "image": "OVERCAST/2015-12-19/camera3/2015-12-19_1248.jpg",
+      "expected_camera": 3,
+      "expected_camera_label": "Camera 3",
+      "expected_slot_mode": "fixed",
+      "expected_total": 21,
+      "expected_empty": 19,
+      "expected_occupied": 2
+    },
+    {
+      "image": "RAINY/2015-12-22/camera4/2015-12-22_0951.jpg",
+      "expected_camera": 4,
+      "expected_camera_label": "Camera 4",
+      "expected_slot_mode": "fixed",
+      "expected_total": 37,
+      "expected_empty": 12,
+      "expected_occupied": 25
+    },
+    {
+      "image": "RAINY/2016-01-09/camera5/2016-01-09_0927.jpg",
+      "expected_camera": 5,
+      "expected_camera_label": "Camera 5",
+      "expected_slot_mode": "fixed",
+      "expected_total": 46,
+      "expected_empty": 44,
+      "expected_occupied": 2
+    },
+    {
+      "image": "RAINY/2016-02-12/camera6/2016-02-12_1654.jpg",
+      "expected_camera": 6,
+      "expected_camera_label": "Camera 6",
+      "expected_slot_mode": "fixed",
+      "expected_total": 44,
+      "expected_empty": 14,
+      "expected_occupied": 30
+    },
+    {
+      "image": "SUNNY/2015-11-12/camera7/2015-11-12_1647.jpg",
+      "expected_camera": 7,
+      "expected_camera_label": "Camera 7",
+      "expected_slot_mode": "fixed",
+      "expected_total": 46,
+      "expected_empty": 13,
+      "expected_occupied": 33
+    },
+    {
+      "image": "SUNNY/2015-12-17/camera8/2015-12-17_0941.jpg",
+      "expected_camera": 8,
+      "expected_camera_label": "Camera 8",
+      "expected_slot_mode": "fixed",
+      "expected_total": 54,
+      "expected_empty": 27,
+      "expected_occupied": 27
+    },
+    {
+      "image": "SUNNY/2016-01-16/camera9/2016-01-16_0940.jpg",
+      "expected_camera": 9,
+      "expected_camera_label": "Camera 9",
+      "expected_slot_mode": "fixed",
+      "expected_total": 28,
+      "expected_empty": 26,
+      "expected_occupied": 2
+    }
+  ]
+}
